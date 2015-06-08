@@ -146,7 +146,7 @@ pmix_client_globals_t pmix_client_globals = {
     .cache_local = NULL,
     .cache_remote = NULL,
 };
-    
+
 /* callback for wait completion */
 static void wait_cbfunc(struct pmix_peer_t *pr, pmix_usock_hdr_t *hdr,
                         pmix_buffer_t *buf, void *cbdata)
@@ -307,6 +307,8 @@ int PMIx_Init(char nspace[], int *rank)
         return rc;
     }
 
+    rc = sm_dstore_open(1);
+    fprintf(stderr, "client sm_dstore_open rc = %d\n", rc);
     return PMIX_SUCCESS;
 }
 
@@ -379,6 +381,9 @@ int PMIx_Finalize(void)
     if (0 <= pmix_client_globals.myserver.sd) {
         CLOSE_THE_SOCKET(pmix_client_globals.myserver.sd);
     }
+
+    sm_dstore_close();
+
     pmix_bfrop_close();
     pmix_sec_finalize();
     

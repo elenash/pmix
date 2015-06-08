@@ -54,6 +54,8 @@
 
 #include "pmix_server_ops.h"
 
+#include "src/dstore/pmix_sm_dstore.h"
+
 // local variables
 static int init_cntr = 0;
 static char *myuri = NULL;
@@ -179,6 +181,10 @@ static pmix_status_t initialize_server_base(pmix_server_module_t *module)
 
     pmix_output_verbose(2, pmix_globals.debug_output,
                         "pmix:server constructed uri %s", myuri);
+
+    int rc;
+    rc = sm_dstore_open(0);
+    fprintf(stderr, "server sm_dstore_open rc = %d\n", rc);
 
     return PMIX_SUCCESS;
 }
@@ -320,9 +326,12 @@ pmix_status_t PMIx_server_finalize(void)
         unlink(myaddress.sun_path);
     }
     
+    sm_dstore_close();
+    
     cleanup_server_state();
     pmix_output_verbose(2, pmix_globals.debug_output,
                         "pmix:server finalize complete");
+    
     return PMIX_SUCCESS;
 }
 

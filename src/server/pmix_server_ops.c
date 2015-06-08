@@ -131,7 +131,7 @@ pmix_status_t pmix_server_commit(pmix_peer_t *peer, pmix_buffer_t *buf)
     pmix_local_modex_caddy_t *lcd, *lcdnext;
     pmix_buffer_t pbkt, xfer;
     pmix_value_t *val;
-    char *data;
+    char *data = NULL;
     size_t sz;
 
     /* shorthand */
@@ -249,6 +249,39 @@ pmix_status_t pmix_server_commit(pmix_peer_t *peer, pmix_buffer_t *buf)
         }
     }
 
+    /* store local scope data to the shared memory segment */
+    PMIX_CONSTRUCT(&pbkt, pmix_buffer_t);
+    if (PMIX_SUCCESS == pmix_hash_fetch(&nptr->server->mylocal, info->rank, "modex", &val) &&
+            NULL != val) {
+        PMIX_CONSTRUCT(&xfer, pmix_buffer_t);
+        PMIX_LOAD_BUFFER(&xfer, val->data.bo.bytes, val->data.bo.size);
+        pmix_buffer_t *pxfer = &xfer;
+        pmix_bfrop.pack(&pbkt, &pxfer, 1, PMIX_BUFFER);
+        xfer.base_ptr = NULL;
+        xfer.bytes_used = 0;
+        PMIX_DESTRUCT(&xfer);
+        PMIX_VALUE_RELEASE(val);
+        /* now pack this proc's contribution into the bucket */
+        rc = sm_data_store(nptr->nspace, info->rank, &pbkt);
+        fprintf(stderr, "tmp for testing 1 rc = %d pid = %d\n", rc, getpid());
+    }
+    PMIX_DESTRUCT(&pbkt);
+    PMIX_CONSTRUCT(&pbkt, pmix_buffer_t);
+    if (PMIX_SUCCESS == pmix_hash_fetch(&nptr->server->myremote, info->rank, "modex", &val) &&
+            NULL != val) {
+        PMIX_CONSTRUCT(&xfer, pmix_buffer_t);
+        PMIX_LOAD_BUFFER(&xfer, val->data.bo.bytes, val->data.bo.size);
+        pmix_buffer_t *pxfer = &xfer;
+        pmix_bfrop.pack(&pbkt, &pxfer, 1, PMIX_BUFFER);
+        xfer.base_ptr = NULL;
+        xfer.bytes_used = 0;
+        PMIX_DESTRUCT(&xfer);
+        PMIX_VALUE_RELEASE(val);
+        /* now pack this proc's contribution into the bucket */
+        rc = sm_data_store(nptr->nspace, info->rank, &pbkt);
+        fprintf(stderr, "tmp for testing 2 rc = %d pid = %d\n", rc, getpid());
+    }
+    PMIX_DESTRUCT(&pbkt);
     return rc;
 }
 
