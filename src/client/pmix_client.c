@@ -146,7 +146,7 @@ pmix_client_globals_t pmix_client_globals = {
     .cache_local = NULL,
     .cache_remote = NULL,
 };
-    
+
 /* callback for wait completion */
 static void wait_cbfunc(struct pmix_peer_t *pr, pmix_usock_hdr_t *hdr,
                         pmix_buffer_t *buf, void *cbdata)
@@ -307,6 +307,12 @@ int PMIx_Init(char nspace[], int *rank)
         return rc;
     }
 
+    if (PMIX_SUCCESS != (rc = sm_dstore_open(1))) {
+        pmix_output(0, "CANNOT ATTACH TO SHARED MEMORY SEGMENT");
+        return PMIX_ERROR;
+    }
+    PMIX_OUTPUT_VERBOSE((1, pmix_globals.debug_output,
+                         "%s:%d:%s: open dstore sm rc = %d", __FILE__, __LINE__, __func__, rc));
     return PMIX_SUCCESS;
 }
 
@@ -379,6 +385,11 @@ int PMIx_Finalize(void)
     if (0 <= pmix_client_globals.myserver.sd) {
         CLOSE_THE_SOCKET(pmix_client_globals.myserver.sd);
     }
+
+    rc = sm_dstore_close();
+    PMIX_OUTPUT_VERBOSE((1, pmix_globals.debug_output,
+                         "%s:%d:%s: close dstore sm rc = %d", __FILE__, __LINE__, __func__, rc));
+
     pmix_bfrop_close();
     pmix_sec_finalize();
     
@@ -483,6 +494,7 @@ int PMIx_Put(pmix_scope_t scope, const char key[], pmix_value_t *val)
         PMIX_RELEASE(kv);
         return rc;
     }
+#if 0
     /* put it in our own modex hash table in case something
      * internal to us wants it - our nsrecord is always
      * first on the list */
@@ -494,6 +506,7 @@ int PMIx_Put(pmix_scope_t scope, const char key[], pmix_value_t *val)
     if (PMIX_SUCCESS != (rc = pmix_hash_store(&ns->modex, pmix_globals.rank, kv))) {
         PMIX_ERROR_LOG(rc);
     }
+#endif
 
     /* pack the cache that matches the scope - global scope needs
      * to go into both local and remote caches */

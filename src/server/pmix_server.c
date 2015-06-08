@@ -54,6 +54,8 @@
 
 #include "pmix_server_ops.h"
 
+#include "src/dstore/pmix_sm_dstore.h"
+
 // local variables
 static int init_cntr = 0;
 static char *myuri = NULL;
@@ -182,6 +184,13 @@ static pmix_status_t initialize_server_base(pmix_server_module_t *module)
     pmix_output_verbose(2, pmix_globals.debug_output,
                         "pmix:server constructed uri %s", myuri);
 
+    if (PMIX_SUCCESS != sm_dstore_open(0)) {
+        pmix_output(0, "CANNOT CREATE SHARED MEMORY SEGMENT");
+        return PMIX_ERROR;
+    }
+    PMIX_OUTPUT_VERBOSE((1, pmix_globals.debug_output,
+                         "%s:%d:%s: open dstore sm succeeded", __FILE__, __LINE__, __func__));
+
     return PMIX_SUCCESS;
 }
 
@@ -292,6 +301,7 @@ static void cleanup_server_state(void)
 
 pmix_status_t PMIx_server_finalize(void)
 {
+    int rc;
     if (1 != init_cntr) {
         --init_cntr;
         return PMIX_SUCCESS;
@@ -322,9 +332,14 @@ pmix_status_t PMIx_server_finalize(void)
         unlink(myaddress.sun_path);
     }
     
+    rc = sm_dstore_close();
+    PMIX_OUTPUT_VERBOSE((1, pmix_globals.debug_output,
+                         "%s:%d:%s: close dstore sm rc = %d", __FILE__, __LINE__, __func__, rc));
+    
     cleanup_server_state();
     pmix_output_verbose(2, pmix_globals.debug_output,
                         "pmix:server finalize complete");
+    
     return PMIX_SUCCESS;
 }
 
@@ -848,6 +863,10 @@ static void _dmodex_req(int sd, short args, void *cbdata)
      * may not be a contribution */
     if (PMIX_SUCCESS == (rc = pmix_hash_fetch(&nptr->server->myremote, info->rank, "modex", &val)) &&
         NULL != val) {
+        /* pack the proc so we know the source */
+        char *foobar = info->nptr->nspace;
+        pmix_bfrop.pack(&pbkt, &foobar, 1, PMIX_STRING);
+        pmix_bfrop.pack(&pbkt, &info->rank, 1, PMIX_INT);
         PMIX_CONSTRUCT(&xfer, pmix_buffer_t);
         PMIX_LOAD_BUFFER(&xfer, val->data.bo.bytes, val->data.bo.size);
         pmix_buffer_t *pxfer = &xfer;
@@ -1597,12 +1616,14 @@ static void modex_cbfunc(int status, const char *data,
                          size_t ndata, void *cbdata)
 {
     pmix_server_trkr_t *tracker = (pmix_server_trkr_t*)cbdata;
-    pmix_buffer_t xfer, *bptr, *databuf, *bpscope, *reply;
+    pmix_buffer_t xfer, *bptr, *databuf, *bpscope, *reply, *copy_bptr;
     pmix_nspace_t *nptr, *ns;
     pmix_server_caddy_t *cd;
     pmix_kval_t *kp;
     char *nspace;
     int rank, rc;
+    pmix_peer_t* peer;
+    int i;
 
     pmix_output_verbose(2, pmix_globals.debug_output,
                         "server:modex_cbfunc called with %d bytes", (int)ndata);
@@ -1649,6 +1670,8 @@ static void modex_cbfunc(int status, const char *data,
         // Loop over rank blobs
         cnt = 1;
         while (PMIX_SUCCESS == (rc = pmix_bfrop.unpack(databuf, &bptr, &cnt, PMIX_BUFFER))) {
+            copy_bptr = PMIX_NEW(pmix_buffer_t);
+            pmix_bfrop.copy_payload(copy_bptr, bptr);
             /* unpack the nspace */
             cnt = 1;
             if (PMIX_SUCCESS != (rc = pmix_bfrop.unpack(bptr, &nspace, &cnt, PMIX_STRING))) {
@@ -1692,6 +1715,26 @@ static void modex_cbfunc(int status, const char *data,
             }
             pmix_output_verbose(2, pmix_globals.debug_output,
                                 "client:unpack fence received blob for rank %d", rank);
+
+            /* TODO probably need to replace hash table "modex" on a server side with shared memory dstore.
+             * For now place data to both of them. But we should not store "remote" data from local processes
+             * in the shared memory dstore, so checking if target process is local or not. */
+            /*FIXME it's too long to go through all local clients to check if target process is local or not. */
+            int local = 0;
+            for (i=0; i < pmix_server_globals.clients.size; i++) {
+                if (NULL != (peer = (pmix_peer_t*)pmix_pointer_array_get_item(&pmix_server_globals.clients, i))) {
+                    if (0 == strcmp(peer->info->nptr->nspace, ns->nspace) && peer->info->rank == rank) {
+                        /* this is out local client, so we don't store its blobs to the sm dstore. */
+                        local = 1;
+                        break;
+                    }
+                }
+            }
+            if (0 == local) {
+                rc = sm_data_store(copy_bptr);
+            }
+            PMIX_RELEASE(copy_bptr);
+
             /* there may be multiple blobs for this rank, each from a different scope */
             cnt = 1;
             while (PMIX_SUCCESS == (rc = pmix_bfrop.unpack(bptr, &bpscope, &cnt, PMIX_BUFFER))) {
@@ -1737,6 +1780,10 @@ static void modex_cbfunc(int status, const char *data,
     }
 
 finish_collective:
+    /* protect the incoming data */
+    xfer.base_ptr = NULL;
+    xfer.bytes_used = 0;
+    /* cleanup */
     PMIX_DESTRUCT(&xfer);
 
     /* setup the reply, starting with the returned status */
@@ -1785,10 +1832,15 @@ static void get_cbfunc(int status, const char *data,
     /* pack the blob being returned */
     PMIX_CONSTRUCT(&buf, pmix_buffer_t);
     PMIX_LOAD_BUFFER(&buf, data, ndata);
-    pmix_bfrop.copy_payload(reply, &buf);
+
+//    pmix_bfrop.copy_payload(reply, &buf);
+
+    /* store data in the sm dstore */
+    rc = sm_data_store(&buf);
     buf.base_ptr = NULL;
     buf.bytes_used = 0;
     PMIX_DESTRUCT(&buf);
+
     /* send the data to the requestor */
     pmix_output_verbose(2, pmix_globals.debug_output,
                         "server:get_cbfunc reply being sent to %s:%d",

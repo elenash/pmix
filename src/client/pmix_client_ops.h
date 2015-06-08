@@ -17,6 +17,8 @@
 #include "src/class/pmix_hash_table.h"
 #include "src/usock/usock.h"
 
+#include "src/class/pmix_shared_memory.h"
+
 BEGIN_C_DECLS
 
 typedef struct {
@@ -45,6 +47,7 @@ typedef struct {
 PMIX_CLASS_DECLARATION(pmix_nrec_t);
 
 extern pmix_client_globals_t pmix_client_globals;
+extern pmix_sm_seg_t global_sm_seg;
 
 void pmix_client_process_nspace_blob(const char *nspace, pmix_buffer_t *bptr);
 
