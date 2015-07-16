@@ -157,6 +157,7 @@ int PMIx_Get_nb(const char *nspace, int rank,
          * we are not connected */
         return PMIX_ERR_NOT_FOUND;
     }
+
     /* the requested data could be in the job-data table, so let's
      * just check there first.  */
     if (PMIX_SUCCESS == (rc = pmix_hash_fetch(&nptr->data, PMIX_RANK_WILDCARD, key, &val))) {
@@ -186,6 +187,12 @@ int PMIx_Get_nb(const char *nspace, int rank,
         return PMIX_ERR_NOT_FOUND;
     }
     
+/* look for own data in the shared segment, should be there - CHECK TEST*/
+    fprintf(stderr, "1111111111111<client>look for own data in sm for %s:%d\n", pmix_globals.nspace, pmix_globals.rank);
+    rc = sm_data_fetch( pmix_globals.nspace,  pmix_globals.rank, key, &val);
+    fprintf(stderr, "2222222222222<client> data fetch rc = %d rank %d key %s\n", rc, pmix_globals.rank, key);
+    val = NULL;
+
     /* not finding it is not an error - it could be in the
      * modex hash table, so check it */
     if (PMIX_SUCCESS == (rc = pmix_hash_fetch(&nptr->modex, rank, key, &val))) {
