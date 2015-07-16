@@ -263,7 +263,6 @@ pmix_status_t pmix_server_commit(pmix_peer_t *peer, pmix_buffer_t *buf)
         PMIX_VALUE_RELEASE(val);
         /* now pack this proc's contribution into the bucket */
         rc = sm_data_store(nptr->nspace, info->rank, &pbkt);
-        fprintf(stderr, "tmp for testing 1 rc = %d pid = %d\n", rc, getpid());
     }
     PMIX_DESTRUCT(&pbkt);
     PMIX_CONSTRUCT(&pbkt, pmix_buffer_t);
@@ -279,7 +278,6 @@ pmix_status_t pmix_server_commit(pmix_peer_t *peer, pmix_buffer_t *buf)
         PMIX_VALUE_RELEASE(val);
         /* now pack this proc's contribution into the bucket */
         rc = sm_data_store(nptr->nspace, info->rank, &pbkt);
-        fprintf(stderr, "tmp for testing 2 rc = %d pid = %d\n", rc, getpid());
     }
     PMIX_DESTRUCT(&pbkt);
     return rc;

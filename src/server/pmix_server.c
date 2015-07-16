@@ -184,7 +184,8 @@ static pmix_status_t initialize_server_base(pmix_server_module_t *module)
 
     int rc;
     rc = sm_dstore_open(0);
-    fprintf(stderr, "server sm_dstore_open rc = %d\n", rc);
+    PMIX_OUTPUT_VERBOSE((1, pmix_globals.debug_output,
+                         "%s:%d:%s: open dstore sm rc = %d", __FILE__, __LINE__, __func__, rc));
 
     return PMIX_SUCCESS;
 }
@@ -296,6 +297,7 @@ static void cleanup_server_state(void)
 
 pmix_status_t PMIx_server_finalize(void)
 {
+    int rc;
     if (1 != init_cntr) {
         --init_cntr;
         return PMIX_SUCCESS;
@@ -326,7 +328,9 @@ pmix_status_t PMIx_server_finalize(void)
         unlink(myaddress.sun_path);
     }
     
-    sm_dstore_close();
+    rc = sm_dstore_close();
+    PMIX_OUTPUT_VERBOSE((1, pmix_globals.debug_output,
+                         "%s:%d:%s: close dstore sm rc = %d", __FILE__, __LINE__, __func__, rc));
     
     cleanup_server_state();
     pmix_output_verbose(2, pmix_globals.debug_output,

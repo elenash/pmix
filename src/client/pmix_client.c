@@ -308,7 +308,8 @@ int PMIx_Init(char nspace[], int *rank)
     }
 
     rc = sm_dstore_open(1);
-    fprintf(stderr, "client sm_dstore_open rc = %d\n", rc);
+    PMIX_OUTPUT_VERBOSE((1, pmix_globals.debug_output,
+                         "%s:%d:%s: open dstore sm rc = %d", __FILE__, __LINE__, __func__, rc));
     return PMIX_SUCCESS;
 }
 
@@ -382,7 +383,9 @@ int PMIx_Finalize(void)
         CLOSE_THE_SOCKET(pmix_client_globals.myserver.sd);
     }
 
-    sm_dstore_close();
+    rc = sm_dstore_close();
+    PMIX_OUTPUT_VERBOSE((1, pmix_globals.debug_output,
+                         "%s:%d:%s: close dstore sm rc = %d", __FILE__, __LINE__, __func__, rc));
 
     pmix_bfrop_close();
     pmix_sec_finalize();

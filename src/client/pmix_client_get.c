@@ -188,9 +188,11 @@ int PMIx_Get_nb(const char *nspace, int rank,
     }
     
 /* look for own data in the shared segment, should be there - CHECK TEST*/
-    fprintf(stderr, "1111111111111<client>look for own data in sm for %s:%d\n", pmix_globals.nspace, pmix_globals.rank);
+    PMIX_OUTPUT_VERBOSE((1, pmix_globals.debug_output,
+                         "%s:%d:%s: look for data in sm for %s:%d key %s", __FILE__, __LINE__, __func__, pmix_globals.nspace, pmix_globals.rank, key));
     rc = sm_data_fetch( pmix_globals.nspace,  pmix_globals.rank, key, &val);
-    fprintf(stderr, "2222222222222<client> data fetch rc = %d rank %d key %s\n", rc, pmix_globals.rank, key);
+    PMIX_OUTPUT_VERBOSE((1, pmix_globals.debug_output,
+                         "%s:%d:%s: data fetch rc %d for %s:%d key %s", __FILE__, __LINE__, __func__, rc, pmix_globals.nspace, pmix_globals.rank, key));
     val = NULL;
 
     /* not finding it is not an error - it could be in the
