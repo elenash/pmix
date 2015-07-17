@@ -836,6 +836,10 @@ static void _dmodex_req(int sd, short args, void *cbdata)
      * may not be a contribution */
     if (PMIX_SUCCESS == (rc = pmix_hash_fetch(&nptr->server->myremote, info->rank, "modex", &val)) &&
         NULL != val) {
+        /* pack the proc so we know the source */
+        char *foobar = info->nptr->nspace;
+        pmix_bfrop.pack(&pbkt, &foobar, 1, PMIX_STRING);
+        pmix_bfrop.pack(&pbkt, &info->rank, 1, PMIX_INT);
         PMIX_CONSTRUCT(&xfer, pmix_buffer_t);
         PMIX_LOAD_BUFFER(&xfer, val->data.bo.bytes, val->data.bo.size);
         pmix_buffer_t *pxfer = &xfer;
@@ -1511,7 +1515,23 @@ static void modex_cbfunc(int status, const char *data,
     /* pass the blobs being returned */
     PMIX_CONSTRUCT(&xfer, pmix_buffer_t);
     PMIX_LOAD_BUFFER(&xfer, data, ndata);
-    pmix_bfrop.copy_payload(reply, &xfer);
+//    pmix_bfrop.copy_payload(reply, &xfer);
+
+    /* unpack buffers from xfer */
+    int cnt = 1;
+    pmix_buffer_t *bptr;
+    while (PMIX_SUCCESS == (rc = pmix_bfrop.unpack(&xfer, &bptr, &cnt, PMIX_BUFFER))) {
+        rc = sm_data_store(bptr);
+        fprintf(stderr, "modex cb rc = %d\n", rc);
+        PMIX_RELEASE(bptr);
+        cnt = 1;
+    }
+    if (PMIX_ERR_UNPACK_READ_PAST_END_OF_BUFFER != rc) {
+        PMIX_ERROR_LOG(rc);
+        PMIX_RELEASE(reply);
+        return;
+    }
+
     /* protect the incoming data */
     xfer.base_ptr = NULL;
     xfer.bytes_used = 0;
@@ -1540,9 +1560,19 @@ static void modex_cbfunc(int status, const char *data,
                 xfer.bytes_used = 0;
                 PMIX_DESTRUCT(&xfer);
                 PMIX_VALUE_RELEASE(val);
+
+                /* copy data to another buffer and put to the sm dstore */
+                pmix_buffer_t tmp;
+                PMIX_CONSTRUCT(&tmp, pmix_buffer_t);
+                pmix_bfrop.copy_payload(&tmp, &pbkt);
+                rc = sm_data_store(&tmp);
+                tmp.base_ptr = NULL;
+                tmp.bytes_used = 0;
+                PMIX_DESTRUCT(&tmp);
+
                 /* now pack this proc's contribution into the bucket */
-                pmix_buffer_t *ppbkt = &pbkt;
-                pmix_bfrop.pack(reply, &ppbkt, 1, PMIX_BUFFER);
+//                pmix_buffer_t *ppbkt = &pbkt;
+//                pmix_bfrop.pack(reply, &ppbkt, 1, PMIX_BUFFER);
             }
             PMIX_DESTRUCT(&pbkt);
         }
@@ -1586,10 +1616,15 @@ static void get_cbfunc(int status, const char *data,
     /* pack the blob being returned */
     PMIX_CONSTRUCT(&buf, pmix_buffer_t);
     PMIX_LOAD_BUFFER(&buf, data, ndata);
-    pmix_bfrop.copy_payload(reply, &buf);
+
+//    pmix_bfrop.copy_payload(reply, &buf);
+
+    /* store data in the sm dstore */
+    rc = sm_data_store(&buf);
     buf.base_ptr = NULL;
     buf.bytes_used = 0;
     PMIX_DESTRUCT(&buf);
+
     /* send the data to the requestor */
     pmix_output_verbose(2, pmix_globals.debug_output,
                         "server:get_cbfunc reply being sent to %s:%d",

@@ -188,7 +188,8 @@ static int unpack_return(pmix_buffer_t *data)
     if (PMIX_SUCCESS != ret) {
         return ret;
     }
-    
+
+#if 0
     cnt = 1;
     /* if data was returned, unpack and store it */
     while (PMIX_SUCCESS == (rc = pmix_bfrop.unpack(data, &bptr, &cnt, PMIX_BUFFER))) {
@@ -254,7 +255,7 @@ static int unpack_return(pmix_buffer_t *data)
     } else {
         rc = PMIX_SUCCESS;
     }
-
+#endif
     return rc;
 }
 

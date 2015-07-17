@@ -486,6 +486,7 @@ int PMIx_Put(pmix_scope_t scope, const char key[], pmix_value_t *val)
     kv->key = strdup((char*)key);
     kv->value = (pmix_value_t*)malloc(sizeof(pmix_value_t));
     pmix_value_xfer(kv->value, val);
+#if 0
     /* put it in our own modex hash table in case something
      * internal to us wants it - our nsrecord is always
      * first on the list */
@@ -497,7 +498,7 @@ int PMIx_Put(pmix_scope_t scope, const char key[], pmix_value_t *val)
     if (PMIX_SUCCESS != (rc = pmix_hash_store(&ns->modex, pmix_globals.rank, kv))) {
         PMIX_ERROR_LOG(rc);
     }
-
+#endif
     /* pack the cache that matches the scope - global scope needs
      * to go into both local and remote caches */
     if (PMIX_LOCAL == scope || PMIX_GLOBAL == scope) {

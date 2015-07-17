@@ -778,13 +778,27 @@ static int store_data_for_rank(ns_track_elem_t *ns_info, int rank, pmix_buffer_t
     return rc;
 }
 
-int sm_data_store(char *nspace, int rank, pmix_buffer_t *buf)
+int sm_data_store(pmix_buffer_t *buf)
 {
-    PMIX_OUTPUT_VERBOSE((1, pmix_globals.debug_output,
-                         "%s:%d:%s: for %s:%d", __FILE__, __LINE__, __func__, nspace, rank));
     int rc;
     size_t i;
     ns_track_elem_t *ns_info;
+    char *nspace;
+    int rank;
+    int cnt;
+    cnt = 1;
+    if (PMIX_SUCCESS != (rc = pmix_bfrop.unpack(buf, &nspace, &cnt, PMIX_STRING))) {
+        PMIX_ERROR_LOG(rc);
+        return;
+    }
+    /* unpack the rank */
+    cnt = 1;
+    if (PMIX_SUCCESS != (rc = pmix_bfrop.unpack(buf, &rank, &cnt, PMIX_INT))) {
+        PMIX_ERROR_LOG(rc);
+        return;
+    }
+    PMIX_OUTPUT_VERBOSE((1, pmix_globals.debug_output,
+                         "%s:%d:%s: for %s:%d", __FILE__, __LINE__, __func__, nspace, rank));
 
     /* first of all look for this namespace in the local track list,
      * if it is there, then shared memory segments for it are created,
@@ -980,7 +994,8 @@ int sm_data_fetch(char *nspace, int rank, char *key, pmix_value_t **kvs)
             buffer.base_ptr = NULL;
             buffer.bytes_used = 0;
             PMIX_DESTRUCT(&buffer);
-            *kvs = &val;
+            //*kvs = &val;
+            rc = pmix_bfrop.copy((void**)kvs, &val, PMIX_VALUE);
             rc = PMIX_SUCCESS;
             break;
         } else {
