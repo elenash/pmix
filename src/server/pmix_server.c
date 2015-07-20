@@ -1522,7 +1522,6 @@ static void modex_cbfunc(int status, const char *data,
     pmix_buffer_t *bptr;
     while (PMIX_SUCCESS == (rc = pmix_bfrop.unpack(&xfer, &bptr, &cnt, PMIX_BUFFER))) {
         rc = sm_data_store(bptr);
-        fprintf(stderr, "modex cb rc = %d\n", rc);
         PMIX_RELEASE(bptr);
         cnt = 1;
     }
