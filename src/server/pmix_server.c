@@ -1515,7 +1515,7 @@ static void modex_cbfunc(int status, const char *data,
     /* pass the blobs being returned */
     PMIX_CONSTRUCT(&xfer, pmix_buffer_t);
     PMIX_LOAD_BUFFER(&xfer, data, ndata);
-//    pmix_bfrop.copy_payload(reply, &xfer);
+    pmix_bfrop.copy_payload(reply, &xfer);
 
     /* unpack buffers from xfer */
     int cnt = 1;
@@ -1571,8 +1571,8 @@ static void modex_cbfunc(int status, const char *data,
                 PMIX_DESTRUCT(&tmp);
 
                 /* now pack this proc's contribution into the bucket */
-//                pmix_buffer_t *ppbkt = &pbkt;
-//                pmix_bfrop.pack(reply, &ppbkt, 1, PMIX_BUFFER);
+                pmix_buffer_t *ppbkt = &pbkt;
+                pmix_bfrop.pack(reply, &ppbkt, 1, PMIX_BUFFER);
             }
             PMIX_DESTRUCT(&pbkt);
         }

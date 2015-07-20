@@ -189,7 +189,6 @@ static int unpack_return(pmix_buffer_t *data)
         return ret;
     }
 
-#if 0
     cnt = 1;
     /* if data was returned, unpack and store it */
     while (PMIX_SUCCESS == (rc = pmix_bfrop.unpack(data, &bptr, &cnt, PMIX_BUFFER))) {
@@ -223,6 +222,7 @@ static int unpack_return(pmix_buffer_t *data)
         }
         pmix_output_verbose(2, pmix_globals.debug_output,
                             "client:unpack fence received blob for rank %d", rank);
+#if 0
         /* there may be multiple blobs for this rank, each from a different scope */
         cnt = 1;
         while (PMIX_SUCCESS == (rc = pmix_bfrop.unpack(bptr, &bpscope, &cnt, PMIX_BUFFER))) {
@@ -248,6 +248,7 @@ static int unpack_return(pmix_buffer_t *data)
         PMIX_RELEASE(bpscope);
         cnt = 1;
         PMIX_RELEASE(bptr);
+#endif
         cnt = 1;
     } // while bptr
     if (PMIX_ERR_UNPACK_READ_PAST_END_OF_BUFFER != rc) {
@@ -255,7 +256,6 @@ static int unpack_return(pmix_buffer_t *data)
     } else {
         rc = PMIX_SUCCESS;
     }
-#endif
     return rc;
 }
 
