@@ -49,6 +49,31 @@ static rank_meta_info *get_rank_meta_info(int rank, seg_desc_t *segdesc);
 seg_desc_t *global_sm_seg_first, *global_sm_seg_last;
 static pmix_list_t namespace_info_list;
 static char *tmp_dir = NULL;
+static size_t initial_segment_size;
+static size_t max_ns_num;
+static size_t meta_segment_size;
+static size_t max_meta_elems;
+static size_t data_segment_size;
+
+static void set_constants_from_env()
+{
+    char *str;
+    if( NULL != (str = getenv("INITIAL_SEG_SIZE")) ) {
+        initial_segment_size = strtol(str, NULL, 10);
+    } else {
+        initial_segment_size = INITIAL_SEG_SIZE;
+    }
+    if( NULL != (str = getenv("NS_META_SEG_SIZE")) ) {
+        meta_segment_size = strtol(str, NULL, 10);
+    } else {
+        meta_segment_size = NS_META_SEG_SIZE;
+    }
+    if( NULL != (str = getenv("NS_DATA_SEG_SIZE")) ) {
+        data_segment_size = strtol(str, NULL, 10);
+    } else {
+        data_segment_size = NS_DATA_SEG_SIZE;
+    }
+}
 
 int sm_dstore_open(int is_cli)
 {
@@ -58,12 +83,15 @@ int sm_dstore_open(int is_cli)
     global_sm_seg_last = NULL;
     is_client = is_cli;
     tmp_dir = strdup(pmix_tmp_directory());
+    set_constants_from_env();
 
     if (0 == is_client) {
         rc = create_initial_shared_segment();
     } else {
         rc = attach_initial_shared_segment();
     }
+    max_ns_num = (initial_segment_size - sizeof(size_t) - sizeof(int))/sizeof(ns_seg_info_t);
+    max_meta_elems = (meta_segment_size - sizeof(size_t))/sizeof(rank_meta_info);
     return rc;
 }
 
@@ -87,15 +115,15 @@ static seg_desc_t *create_new_segment(segment_type type, char *nsname, uint32_t 
     seg_desc_t *new_seg = NULL;
     switch (type) {
         case INITIAL_SEGMENT:
-            size = sizeof(global_segment);
+            size = initial_segment_size;
             snprintf(file_name, PMIX_PATH_MAX, "%s/initial-pmix_shared-segment-%u", tmp_dir, id);
             break;
         case NS_META_SEGMENT:
-            size = sizeof(ns_meta_segment);
+            size = meta_segment_size;
             snprintf(file_name, PMIX_PATH_MAX, "%s/smseg-%s-%u", tmp_dir, nsname, id);
             break;
         case NS_DATA_SEGMENT:
-            size = NS_DATA_SEG_SIZE;
+            size = data_segment_size;
             snprintf(file_name, PMIX_PATH_MAX, "%s/smdataseg-%s-%d", tmp_dir, nsname, id);
             break;
         default:
@@ -128,15 +156,15 @@ static seg_desc_t *attach_new_segment(segment_type type, char *nsname, uint32_t 
     new_seg->type = type;
     switch (type) {
         case INITIAL_SEGMENT:
-            new_seg->seg_info.seg_size = sizeof(global_segment);
+            new_seg->seg_info.seg_size = initial_segment_size;
             snprintf(new_seg->seg_info.seg_name, PMIX_PATH_MAX, "%s/initial-pmix_shared-segment-%u", tmp_dir, id);
             break;
         case NS_META_SEGMENT:
-            new_seg->seg_info.seg_size = sizeof(ns_meta_segment);
+            new_seg->seg_info.seg_size = meta_segment_size;
             snprintf(new_seg->seg_info.seg_name, PMIX_PATH_MAX, "%s/smseg-%s-%u", tmp_dir, nsname, id);
             break;
         case NS_DATA_SEGMENT:
-            new_seg->seg_info.seg_size = NS_DATA_SEG_SIZE;
+            new_seg->seg_info.seg_size = data_segment_size;
             snprintf(new_seg->seg_info.seg_name, PMIX_PATH_MAX, "%s/smdataseg-%s-%d", tmp_dir, nsname, id);
             break;
         default:
@@ -164,7 +192,7 @@ static int create_initial_shared_segment()
         global_sm_seg_last = global_sm_seg_first;
         rc = PMIX_SUCCESS;
     }
-    ((global_segment *)(seg->seg_info.seg_base_addr))->full = 0;
+    memset(seg->seg_info.seg_base_addr, 0, initial_segment_size);
 
     return rc;
 }
@@ -275,24 +303,29 @@ static int put_ns_info_to_initial_segment(const char *nspace, pmix_sm_seg_t *met
     PMIX_OUTPUT_VERBOSE((1, pmix_globals.debug_output,
                          "%s:%d:%s", __FILE__, __LINE__, __func__));
     ns_seg_info_t elem;
-    global_segment *cur_segment = (global_segment *)(global_sm_seg_last->seg_info.seg_base_addr);
+    size_t num_elems;
+    num_elems = *((size_t*)(global_sm_seg_last->seg_info.seg_base_addr));
+    seg_desc_t *last_seg = global_sm_seg_last;
 
-    if (NUM_NS == cur_segment->num_elems) {
-        if (NULL == (global_sm_seg_last = extend_segment(global_sm_seg_last, NULL))) {
+    if (max_ns_num == num_elems) {
+        if (NULL == (last_seg = extend_segment(last_seg, NULL))) {
             PMIX_ERROR_LOG(PMIX_ERROR);
             return PMIX_ERROR;
         }
-        cur_segment->full = 1;
-        cur_segment = (global_segment *)(global_sm_seg_last->seg_info.seg_base_addr);
-        cur_segment->num_elems = 0;
+        /* mark previous segment as full */
+        int full = 1;
+        memcpy((uint8_t*)(global_sm_seg_last->seg_info.seg_base_addr + sizeof(size_t)), &full, sizeof(int));
+        global_sm_seg_last = last_seg;
+        memset(global_sm_seg_last->seg_info.seg_base_addr, 0, initial_segment_size);
     }
     strncpy(elem.ns_name, nspace, PMIX_MAX_NSLEN);
     elem.num_meta_seg = 1;
     elem.num_data_seg = 1;
-    elem.meta_segsize = sizeof(ns_meta_segment);
-    elem.data_segsize = NS_DATA_SEG_SIZE;
-    cur_segment->ns_seg_info[cur_segment->num_elems] = elem;
-    cur_segment->num_elems++;
+    elem.meta_segsize = meta_segment_size;
+    elem.data_segsize = data_segment_size;
+    memcpy((uint8_t*)(global_sm_seg_last->seg_info.seg_base_addr) + sizeof(size_t) + sizeof(int) + num_elems * sizeof(ns_seg_info_t), &elem, sizeof(ns_seg_info_t));
+    num_elems++;
+    memcpy((uint8_t*)(global_sm_seg_last->seg_info.seg_base_addr), &num_elems, sizeof(size_t));
     return PMIX_SUCCESS;
 }
 
@@ -303,12 +336,11 @@ static void update_initial_segment_info()
                          "%s:%d:%s", __FILE__, __LINE__, __func__));
     size_t i;
     seg_desc_t *tmp;
-    global_segment *cur_segment;
     tmp = global_sm_seg_first;
     /* go through all global segments */
     do {
-        cur_segment = (global_segment *)(tmp->seg_info.seg_base_addr);
-        if (NULL == tmp->next && 1 == cur_segment->full) {
+        /* check if current segment was marked as full but no more next segment is in the chain */
+        if (NULL == tmp->next && 1 == *((int*)((uint8_t*)(tmp->seg_info.seg_base_addr) + sizeof(size_t)))) {
             tmp->next = attach_new_segment(INITIAL_SEGMENT, NULL, tmp->id+1);
         }
         tmp = tmp->next;
@@ -324,22 +356,24 @@ static ns_seg_info_t *get_ns_info_from_initial_segment(const char *nspace)
     int rc;
     size_t i;
     seg_desc_t *tmp;
-    global_segment *cur_segment;
-    ns_seg_info_t *elem;
+    ns_seg_info_t *elem, *cur_elem;
     elem = NULL;
+    size_t num_elems;
 
     tmp = global_sm_seg_first;
-    
+
+    rc = 1;
     /* go through all global segments */
     do {
-        cur_segment = (global_segment *)(tmp->seg_info.seg_base_addr);
-        for (i = 0; i < cur_segment->num_elems; i++) {
-            if (0 == (rc = strncmp(cur_segment->ns_seg_info[i].ns_name, nspace, strlen(nspace)))) {
+        num_elems = *((size_t*)(tmp->seg_info.seg_base_addr));
+        for (i = 0; i < num_elems; i++) {
+            cur_elem = (ns_seg_info_t*)((uint8_t*)(tmp->seg_info.seg_base_addr) + sizeof(size_t) + sizeof(int) + i * sizeof(ns_seg_info_t));
+            if (0 == (rc = strncmp(cur_elem->ns_name, nspace, strlen(nspace)))) {
                 break;
             }
         }
         if (0 == rc) {
-            elem = &(cur_segment->ns_seg_info[i]);
+            elem = cur_elem;
             //fprintf(stderr, "get_ns_info_from_initial_segment ret %s:%lu\n", elem->ns_name, elem->num_meta_seg);
             break;
         }
@@ -379,8 +413,8 @@ static ns_track_elem_t *add_new_namespace(char *nspace)
     strncpy(ns_info.ns_name, nspace, PMIX_MAX_NSLEN);
     ns_info.num_meta_seg = 1;
     ns_info.num_data_seg = 1;
-    ns_info.meta_segsize = sizeof(ns_meta_segment);
-    ns_info.data_segsize = NS_DATA_SEG_SIZE;
+    ns_info.meta_segsize = meta_segment_size;
+    ns_info.data_segsize = data_segment_size;
     rc = update_ns_elem(new_elem, &ns_info);
     if (PMIX_SUCCESS != rc) {
         PMIX_RELEASE(new_elem);
@@ -389,9 +423,9 @@ static ns_track_elem_t *add_new_namespace(char *nspace)
     }
     pmix_list_append(&namespace_info_list, &new_elem->super);
 
-    /* update shared memory for this namespace */
-    ns_meta_segment *mseg = (ns_meta_segment*)(new_elem->meta_seg->seg_info.seg_base_addr);
-    mseg->num_elems = 0;
+    /* zero shared memory for this namespace */
+    memset(new_elem->meta_seg->seg_info.seg_base_addr, 0, meta_segment_size);
+    memset(new_elem->data_seg->seg_info.seg_base_addr, 0, data_segment_size);
 
     /* put ns's shared segments info to the global meta segment. */
     rc = put_ns_info_to_initial_segment(nspace, &new_elem->meta_seg->seg_info, &new_elem->data_seg->seg_info);
@@ -406,12 +440,15 @@ static rank_meta_info *get_rank_meta_info(int rank, seg_desc_t *segdesc)
     size_t i;
     rank_meta_info *elem = NULL;
     seg_desc_t *tmp = segdesc;
+    size_t num_elems;
+    rank_meta_info *cur_elem;
     /* go through all existing meta segments for this namespace */
     do {
-        ns_meta_segment *metaseg = (ns_meta_segment *)(tmp->seg_info.seg_base_addr);
-        for (i = 0; i < metaseg->num_elems; i++) {
-            if (rank == metaseg->meta_info[i].rank) {
-                elem = &(metaseg->meta_info[i]);
+        num_elems = *((size_t*)(tmp->seg_info.seg_base_addr));
+        for (i = 0; i < num_elems; i++) {
+            cur_elem = (rank_meta_info*)((uint8_t*)(tmp->seg_info.seg_base_addr) + sizeof(size_t) + i * sizeof(rank_meta_info));
+            if (rank == cur_elem->rank) {
+                elem = cur_elem;
                 break;
             }
         }
@@ -430,8 +467,8 @@ static uint8_t *get_data_region_by_offset(seg_desc_t *segdesc, size_t offset)
     uint8_t *dataaddr = NULL;
     /* go through all existing data segments for this namespace */
     do {
-        if (rel_offset >= NS_DATA_SEG_SIZE) {
-            rel_offset -= NS_DATA_SEG_SIZE;
+        if (rel_offset >= data_segment_size) {
+            rel_offset -= data_segment_size;
         } else {
             dataaddr = tmp->seg_info.seg_base_addr + rel_offset;
         }
@@ -449,13 +486,13 @@ static int update_rank_meta_info(ns_track_elem_t *ns_info, rank_meta_info *rinfo
      * so look for the last existing meta segment. */
     seg_desc_t *tmp;
     size_t num_elems;
+    rank_meta_info *cur_elem;
     tmp = ns_info->meta_seg;
     while (NULL != tmp->next) {
         tmp = tmp->next;
     }
-    ns_meta_segment *metaseg = (ns_meta_segment *)(tmp->seg_info.seg_base_addr);
-    num_elems = metaseg->num_elems;
-    if (NUM_META_ELEMS <= num_elems) {
+    num_elems = *((size_t*)(tmp->seg_info.seg_base_addr));
+    if (max_meta_elems <= num_elems) {
         PMIX_OUTPUT_VERBOSE((2, pmix_globals.debug_output,
                     "%s:%d:%s: extend meta segment for nspace %s", __FILE__, __LINE__, __func__, ns_info->ns_name));
         /* extend meta segment, so create a new one */
@@ -465,17 +502,19 @@ static int update_rank_meta_info(ns_track_elem_t *ns_info, rank_meta_info *rinfo
             return PMIX_ERROR;
         }
         ns_info->num_meta_seg++;
-        metaseg = (ns_meta_segment *)(tmp->seg_info.seg_base_addr);
-        metaseg->num_elems = 0;
+        memset(tmp->seg_info.seg_base_addr, 0, sizeof(rank_meta_info));
         /* update_ns_info_in_initial_segment */
         ns_seg_info_t *elem = get_ns_info_from_initial_segment(ns_info->ns_name);
         if (ns_info->num_meta_seg != elem->num_meta_seg) {
             //elem->num_meta_seg++;
             elem->num_meta_seg = ns_info->num_meta_seg;
         }
+        num_elems = 0;
     }
-    metaseg->meta_info[metaseg->num_elems] = *rinfo;
-    metaseg->num_elems++;
+    cur_elem = (rank_meta_info*)((uint8_t*)(tmp->seg_info.seg_base_addr) + sizeof(size_t) + num_elems * sizeof(rank_meta_info));
+    memcpy(cur_elem, rinfo, sizeof(rank_meta_info));
+    num_elems++;
+    memcpy(tmp->seg_info.seg_base_addr, &num_elems, sizeof(size_t));
     return PMIX_SUCCESS;
 }
 
@@ -490,7 +529,7 @@ static size_t put_data_to_the_end(ns_track_elem_t *ns_info, seg_desc_t *dataseg,
 {
     PMIX_OUTPUT_VERBOSE((2, pmix_globals.debug_output,
                          "%s:%d:%s: key %s", __FILE__, __LINE__, __func__, key));
-    /* TODO check if size of blob <= NS_DATA_SEG_SIZE */
+    /* TODO check if size of blob <= data_segment_size */
     size_t offset;
     seg_desc_t *tmp;
     tmp = dataseg;
@@ -508,11 +547,11 @@ static size_t put_data_to_the_end(ns_track_elem_t *ns_info, seg_desc_t *dataseg,
     if (!strncmp(key, "EXTENSION_SLOT", PMIX_MAX_KEYLEN)) {
         add_space = 0;
     }
-    if (offset + PMIX_MAX_KEYLEN + sizeof(size_t) + size + add_space > NS_DATA_SEG_SIZE)  {
+    if (offset + PMIX_MAX_KEYLEN + sizeof(size_t) + size + add_space > data_segment_size)  {
         /* store new offset to the extension slot here */
         id++;
         if (flag) {
-            size_t new_offset = id * NS_DATA_SEG_SIZE + sizeof(size_t);
+            size_t new_offset = id * data_segment_size + sizeof(size_t);
             sz = sizeof(size_t);
             strncpy((uint8_t*)(tmp->seg_info.seg_base_addr) + offset, "EXTENSION_SLOT", PMIX_MAX_KEYLEN);
             memcpy((uint8_t*)tmp->seg_info.seg_base_addr + offset + PMIX_MAX_KEYLEN, &sz, sizeof(size_t));
@@ -539,9 +578,9 @@ static size_t put_data_to_the_end(ns_track_elem_t *ns_info, seg_desc_t *dataseg,
     /* update offset at the beginning of current segment */
     size_t data_ended = offset + PMIX_MAX_KEYLEN + sizeof(size_t) + size;
     memcpy(tmp->seg_info.seg_base_addr, &data_ended, sizeof(size_t));
-    size_t global_offset = offset + id * NS_DATA_SEG_SIZE;
+    size_t global_offset = offset + id * data_segment_size;
     PMIX_OUTPUT_VERBOSE((2, pmix_globals.debug_output,
-                         "%s:%d:%s: key %s, rel start offset %lu, rel end offset %lu, abs shift %lu size %lu", __FILE__, __LINE__, __func__, key, offset, data_ended, id * NS_DATA_SEG_SIZE, size));
+                         "%s:%d:%s: key %s, rel start offset %lu, rel end offset %lu, abs shift %lu size %lu", __FILE__, __LINE__, __func__, key, offset, data_ended, id * data_segment_size, size));
     return global_offset;
 }
 
@@ -693,6 +732,7 @@ static int store_data_for_rank(ns_track_elem_t *ns_info, int rank, pmix_buffer_t
     seg_desc_t *metadesc, *datadesc;
     
     rank_meta_info *rinfo = NULL;
+    size_t num_elems;
 
     metadesc = ns_info->meta_seg;    
     datadesc = ns_info->data_seg;    
@@ -702,10 +742,9 @@ static int store_data_for_rank(ns_track_elem_t *ns_info, int rank, pmix_buffer_t
         return PMIX_ERROR;
     }
     
-    ns_meta_segment *my_metasegment = (ns_meta_segment *)(metadesc->seg_info.seg_base_addr);
-    size_t count = my_metasegment->num_elems;
+    num_elems = *((size_t*)(metadesc->seg_info.seg_base_addr));
     int replace_flag = 0;
-    if (0 < count) {
+    if (0 < num_elems) {
         /* go through all elements in meta segment and look for target rank. */
         rinfo = get_rank_meta_info(rank, metadesc);
         if (NULL != rinfo) {
@@ -855,6 +894,7 @@ int sm_data_fetch(char *nspace, int rank, char *key, pmix_value_t **kvs)
     size_t i;
     ns_track_elem_t *ns_info;
     rank_meta_info *rinfo = NULL;
+    size_t num_elems;
 
     /* first of all look for this namespace in the initial segment,
      * if it is there, get numbers of meta & data segments and
@@ -888,9 +928,9 @@ int sm_data_fetch(char *nspace, int rank, char *key, pmix_value_t **kvs)
     /* now we know info about meta segment for this namespace. */
     seg_desc_t *meta_seg = ns_info->meta_seg;    
     seg_desc_t *data_seg = ns_info->data_seg;    
-    size_t count = ((ns_meta_segment *)(meta_seg->seg_info.seg_base_addr))->num_elems;
-    //fprintf(stderr,  "<client>meta_seg %x, dataseg %x count elems in meta seg %d rank %d\n", meta_seg, data_seg, count, rank);
-    if (0 == count) {
+    num_elems = *((size_t*)(meta_seg->seg_info.seg_base_addr));
+    //fprintf(stderr,  "<client>meta_seg %x, dataseg %x num_elems in meta seg %d rank %d\n", meta_seg, data_seg, num_elems, rank);
+    if (0 == num_elems) {
         /* no data for this rank is found in the shared memory. */
         PMIX_OUTPUT_VERBOSE((0, pmix_globals.debug_output,
                     "%s:%d:%s:  no data for this rank is found in the shared memory. rank %d", __FILE__, __LINE__, __func__, rank));

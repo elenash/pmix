@@ -2,16 +2,23 @@
 #include "src/util/error.h"
 
 #include "src/class/pmix_shared_memory.h"
+#include "src/buffer_ops/types.h"
 
-#define NUM_META_ELEMS 10
-#define NUM_NS 10
-#define NS_DATA_SEG_SIZE 10000
+#define INITIAL_SEG_SIZE 4096
+#define NS_META_SEG_SIZE (1<<22)
+#define NS_DATA_SEG_SIZE (1<<22)
 
 typedef enum {
     INITIAL_SEGMENT,
     NS_META_SEGMENT,
     NS_DATA_SEGMENT
 } segment_type;
+
+/* initial segment format:
+ * size_t num_elems;
+ * int full; //indicate to client that it needs to attach to the next segment
+ * ns_seg_info_t ns_seg_info[max_ns_num];
+ */
 
 typedef struct {
     char ns_name[PMIX_MAX_NSLEN+1];
@@ -21,23 +28,16 @@ typedef struct {
     size_t data_segsize;/*if it is based on number of processes in namespace, it will be different among namespaces, but same for all data segments for this nspace. */
 } ns_seg_info_t;
 
-typedef struct {
-    size_t num_elems;
-    ns_seg_info_t ns_seg_info[NUM_NS];
-    int full;/* if 1, then additional segment is created. */
-} global_segment;
+/* meta segment format:
+ * size_t num_elems;
+ * rank_meta_info meta_info[max_meta_elems];
+ */
 
 typedef struct {
     size_t rank;
     size_t offset;
     size_t count;
 } rank_meta_info;
-
-typedef struct {
-    size_t num_elems;
-    rank_meta_info meta_info[NUM_META_ELEMS];
-} ns_meta_segment;
-
 
 /* this structs are used to store information about
  * shared segments addresses locally at each process,
@@ -65,3 +65,5 @@ PMIX_CLASS_DECLARATION(ns_track_elem_t);
 
 int sm_dstore_open(int is_cli);
 int sm_dstore_close();
+int sm_data_store(pmix_buffer_t *buf);
+int sm_data_fetch(char *nspace, int rank, char *key, pmix_value_t **kvs);
