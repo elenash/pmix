@@ -307,7 +307,10 @@ int PMIx_Init(char nspace[], int *rank)
         return rc;
     }
 
-    rc = sm_dstore_open(1);
+    if (PMIX_SUCCESS != (rc = sm_dstore_open(1))) {
+        pmix_output(0, "CANNOT ATTACH TO SHARED MEMORY SEGMENT");
+        return PMIX_ERROR;
+    }
     PMIX_OUTPUT_VERBOSE((1, pmix_globals.debug_output,
                          "%s:%d:%s: open dstore sm rc = %d", __FILE__, __LINE__, __func__, rc));
     return PMIX_SUCCESS;

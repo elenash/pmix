@@ -182,10 +182,12 @@ static pmix_status_t initialize_server_base(pmix_server_module_t *module)
     pmix_output_verbose(2, pmix_globals.debug_output,
                         "pmix:server constructed uri %s", myuri);
 
-    int rc;
-    rc = sm_dstore_open(0);
+    if (PMIX_SUCCESS != sm_dstore_open(0)) {
+        pmix_output(0, "CANNOT CREATE SHARED MEMORY SEGMENT");
+        return PMIX_ERROR;
+    }
     PMIX_OUTPUT_VERBOSE((1, pmix_globals.debug_output,
-                         "%s:%d:%s: open dstore sm rc = %d", __FILE__, __LINE__, __func__, rc));
+                         "%s:%d:%s: open dstore sm succeeded", __FILE__, __LINE__, __func__));
 
     return PMIX_SUCCESS;
 }
@@ -1561,13 +1563,15 @@ static void modex_cbfunc(int status, const char *data,
                 PMIX_VALUE_RELEASE(val);
 
                 /* copy data to another buffer and put to the sm dstore */
-                pmix_buffer_t tmp;
+                /* no need to store local data twice. It was already put during fence,
+                 * so commenting it t the moment. */
+                /*pmix_buffer_t tmp;
                 PMIX_CONSTRUCT(&tmp, pmix_buffer_t);
                 pmix_bfrop.copy_payload(&tmp, &pbkt);
                 rc = sm_data_store(&tmp);
                 tmp.base_ptr = NULL;
                 tmp.bytes_used = 0;
-                PMIX_DESTRUCT(&tmp);
+                PMIX_DESTRUCT(&tmp);*/
 
                 /* now pack this proc's contribution into the bucket */
                 pmix_buffer_t *ppbkt = &pbkt;

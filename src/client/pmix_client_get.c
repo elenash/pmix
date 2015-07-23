@@ -159,6 +159,7 @@ int PMIx_Get_nb(const char *nspace, int rank,
 
     /* the requested data could be in the job-data table, so let's
      * just check there first.  */
+    PMIX_VALUE_CREATE(val, 1);
     if (PMIX_SUCCESS == (rc = pmix_hash_fetch(&nptr->data, PMIX_RANK_WILDCARD, key, &val))) {
         /* found it - return it via appropriate channel */
         cb = PMIX_NEW(pmix_cb_t);
@@ -188,7 +189,6 @@ int PMIx_Get_nb(const char *nspace, int rank,
     
     /* not finding it is not an error - it could be in the
      * modex hash table, so check it */
-    PMIX_VALUE_CREATE(val, 1);
     if (PMIX_SUCCESS == (rc = sm_data_fetch( nm,  rank, key, &val))) {
 //    if (PMIX_SUCCESS == (rc = pmix_hash_fetch(&nptr->modex, rank, key, &val))) {
         pmix_output_verbose(2, pmix_globals.debug_output,
@@ -240,7 +240,7 @@ int PMIx_Get_nb(const char *nspace, int rank,
             return PMIX_SUCCESS;
         }
     }
-    
+
     /* we don't have a pending request, so let's create one */
     if (NULL == (msg = pack_get(nm, rank, key, PMIX_GETNB_CMD))) {
         return PMIX_ERROR;
@@ -268,7 +268,9 @@ static void value_cbfunc(int status, pmix_value_t *kv, void *cbdata)
     pmix_cb_t *cb = (pmix_cb_t*)cbdata;
 
     cb->status = status;
-    pmix_bfrop.copy((void**)&cb->value, kv, PMIX_VALUE);
+    if (PMIX_SUCCESS == status) {
+        pmix_bfrop.copy((void**)&cb->value, kv, PMIX_VALUE);
+    }
     cb->active = false;
 }
 
@@ -361,6 +363,11 @@ static void getnb_cbfunc(struct pmix_peer_t *pr, pmix_usock_hdr_t *hdr,
     PMIX_OUTPUT_VERBOSE((1, pmix_globals.debug_output,
                          "%s:%d:%s: data fetch rc %d for %s:%d key %s val->type = %d", __FILE__, __LINE__, __func__, rc, cb->nspace, cb->rank, cb->key, val->type));
 
+    if (PMIX_SUCCESS != rc) {
+        PMIX_VALUE_RELEASE(val);
+        val = NULL;
+    }
+
     /*kp = PMIX_NEW(pmix_kval_t);
     kp->key = strdup(cb->key);
     rc = pmix_bfrop.copy((void**)&(kp->value), val, PMIX_VALUE);
@@ -368,11 +375,6 @@ static void getnb_cbfunc(struct pmix_peer_t *pr, pmix_usock_hdr_t *hdr,
         PMIX_ERROR_LOG(rc);
     }
     PMIX_RELEASE(kp);*/
-
-    if (PMIX_ERROR == rc) {
-        PMIX_VALUE_RELEASE(val);
-        val = NULL;
-    }
 
 #if 0
     /* unpack the nspace */
@@ -447,7 +449,7 @@ static void getnb_cbfunc(struct pmix_peer_t *pr, pmix_usock_hdr_t *hdr,
     PMIX_LIST_FOREACH_SAFE(cb, cb2, &pmix_client_globals.pending_requests, pmix_cb_t) {
         if (0 == strncmp(nptr->nspace, cb->nspace, PMIX_MAX_NSLEN) && cb->rank == rank) {
            /* we have the data - see if we can find the key */
-            val = NULL;
+            //val = NULL;
             //rc = pmix_hash_fetch(&nptr->modex, rank, cb->key, &val);
             PMIX_VALUE_CREATE(val, 1);
             rc = sm_data_fetch( cb->nspace,  rank, cb->key, &val);
