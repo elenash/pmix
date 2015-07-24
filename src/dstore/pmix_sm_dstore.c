@@ -5,6 +5,17 @@
 #include <sys/stat.h>
 #include <sys/file.h>
 
+static int pmix_getpagesize(void)
+{
+#if defined(_SC_PAGESIZE )
+    return sysconf(_SC_PAGESIZE);
+#elif defined(_SC_PAGE_SIZE)
+    return sysconf(_SC_PAGE_SIZE);
+#else
+    return 65536; /* safer to overestimate than under */
+#endif
+}
+
 static void delete_sm_desc(seg_desc_t *desc)
 {
     seg_desc_t *tmp;
@@ -16,7 +27,7 @@ static void delete_sm_desc(seg_desc_t *desc)
             segment_unlink(&desc->seg_info);
         }
         segment_detach(&desc->seg_info);
-        /* FIXME return status? */
+        /* TODO return status? */
         free(desc);
         desc = tmp;
     }
@@ -73,7 +84,11 @@ static void set_constants_from_env()
         meta_segment_size = NS_META_SEG_SIZE;
     }
     if( NULL != (str = getenv("NS_DATA_SEG_SIZE")) ) {
-        data_segment_size = strtol(str, NULL, 10);
+        data_segment_size = strtoul(str, NULL, 10);
+        int page_size = pmix_getpagesize();
+        if ((size_t)page_size > data_segment_size) {
+            data_segment_size = (size_t)page_size;
+        }
     } else {
         data_segment_size = NS_DATA_SEG_SIZE;
     }
@@ -100,7 +115,13 @@ int sm_dstore_open(int is_cli)
     lockfile_name = malloc(256);
     snprintf(lockfile_name, 256, "%s/dstore_sm.lock", tmp_dir);
     if (0 == is_client) {
-        lockfd = open(lockfile_name, O_CREAT | O_RDWR, 0600);
+        lockfd = open(lockfile_name, O_CREAT | O_RDWR | O_EXCL, 0600);
+        /* if previous launch was crashed, the lockfile might not be deleted and unlocked,
+         * so we delete it and create a new one. */
+        if (-1 == lockfd) {
+            unlink(lockfile_name);
+            lockfd = open(lockfile_name, O_CREAT | O_RDWR, 0600);
+        }
     } else {
         lockfd = open(lockfile_name, O_RDWR);
     }
@@ -485,6 +506,10 @@ static int update_rank_meta_info(ns_track_elem_t *ns_info, rank_meta_info *rinfo
         memset(tmp->seg_info.seg_base_addr, 0, sizeof(rank_meta_info));
         /* update_ns_info_in_initial_segment */
         ns_seg_info_t *elem = get_ns_info_from_initial_segment(ns_info->ns_name);
+        if (NULL == elem) {
+            PMIX_ERROR_LOG(PMIX_ERROR);
+            return PMIX_ERROR;
+        }
         if (ns_info->num_meta_seg != elem->num_meta_seg) {
             //elem->num_meta_seg++;
             elem->num_meta_seg = ns_info->num_meta_seg;
@@ -509,7 +534,6 @@ static size_t put_data_to_the_end(ns_track_elem_t *ns_info, seg_desc_t *dataseg,
 {
     PMIX_OUTPUT_VERBOSE((2, pmix_globals.debug_output,
                          "%s:%d:%s: key %s", __FILE__, __LINE__, __func__, key));
-    /* TODO check if size of blob <= data_segment_size */
     size_t offset;
     seg_desc_t *tmp;
     tmp = dataseg;
@@ -521,11 +545,23 @@ static size_t put_data_to_the_end(ns_track_elem_t *ns_info, seg_desc_t *dataseg,
         id++;
     }
     offset = *((size_t*)(tmp->seg_info.seg_base_addr));
+    if (0 == offset) {
+        /* this is the first created data segment, the first 8 bytes are used to place the free offset value itself */
+        offset = sizeof(size_t);
+    }
     /* We should provide additional space at the end of segment to place EXTENSION_SLOT to have an ability to enlarge data for this rank.
      * But in case if this function was called with EXTENSION_SLOT key we don't do it, just place this data to the provided slot. */
     add_space = EXT_SLOT_SIZE;
     if (!strncmp(key, "EXTENSION_SLOT", PMIX_MAX_KEYLEN+1)) {
         add_space = 0;
+    }
+
+    if (sizeof(size_t) + PMIX_MAX_KEYLEN + 1 + sizeof(size_t) + size + add_space > data_segment_size) {
+        /* this is an error case: segment is so small that cannot place evem a single key-value pair.
+         * warn a user about it and fail. */
+        offset = 0; /* offset cannot be 0 in normal case, so we use this value to indicate a problem. */
+        pmix_output(0, "PLEASE set NS_DATA_SEG_SIZE to value which is larger when %lu.", sizeof(size_t) + PMIX_MAX_KEYLEN + 1 + sizeof(size_t) + size + add_space);
+        return offset;
     }
     if (offset + PMIX_MAX_KEYLEN + 1 + sizeof(size_t) + size + add_space > data_segment_size)  {
         /* store new offset to the extension slot here */
@@ -541,11 +577,16 @@ static size_t put_data_to_the_end(ns_track_elem_t *ns_info, seg_desc_t *dataseg,
         tmp = extend_segment(tmp, ns_info->ns_name);
         if (NULL == tmp) {
             PMIX_ERROR_LOG(PMIX_ERROR);
-            return PMIX_ERROR;
+            offset = 0; /* offset cannot be 0 in normal case, so we use this value to indicate a problem. */
+            return offset;
         }
         ns_info->num_data_seg++;
         /* update_ns_info_in_initial_segment */
         ns_seg_info_t *elem = get_ns_info_from_initial_segment(ns_info->ns_name);
+        if (NULL == elem) {
+            PMIX_ERROR_LOG(PMIX_ERROR);
+            return PMIX_ERROR;
+        }
         elem->num_data_seg++;
 
         offset = sizeof(size_t);
@@ -588,6 +629,12 @@ static int pmix_sm_store(ns_track_elem_t *ns_info, int rank, pmix_kval_t *kval, 
     if (0 == replace_flag) {
         /* there is no data blob for this rank yet, so add it. */
         offset = put_data_to_the_end(ns_info, datadesc, kval->key, buffer->base_ptr, size, 1);
+        if (0 == offset) {
+            /* this is an error */
+            PMIX_RELEASE(buffer);
+            PMIX_ERROR_LOG(PMIX_ERROR);
+            return PMIX_ERROR;
+        }
         if (NULL == *rinfo) {
             *rinfo = (rank_meta_info*)malloc(sizeof(rank_meta_info));
             (*rinfo)->rank = rank;
@@ -635,6 +682,12 @@ static int pmix_sm_store(ns_track_elem_t *ns_info, int rank, pmix_kval_t *kval, 
                     if (0 == update_ext_slot) {
                         /* add to the end */
                         offset = put_data_to_the_end(ns_info, datadesc, kval->key, buffer->base_ptr, size, 0);
+                        if (0 == offset) {
+                            /* this is an error */
+                            PMIX_RELEASE(buffer);
+                            PMIX_ERROR_LOG(PMIX_ERROR);
+                            return PMIX_ERROR;
+                        }
                         PMIX_OUTPUT_VERBOSE((10, pmix_globals.debug_output,
                                     "%s:%d:%s: for rank %d, replace flag %d item not found ext slot empty, put key %s to the end", __FILE__, __LINE__, __func__, rank, replace_flag, kval->key));
                         size_t tmp = 0.0;
@@ -658,6 +711,12 @@ static int pmix_sm_store(ns_track_elem_t *ns_info, int rank, pmix_kval_t *kval, 
                     strncpy(addr, "INVALIDATED", PMIX_MAX_KEYLEN+1);
                     /* add to the end */
                     offset = put_data_to_the_end(ns_info, datadesc, kval->key, buffer->base_ptr, size, 1);
+                    if (0 == offset) {
+                        /* this is an error */
+                        PMIX_RELEASE(buffer);
+                        PMIX_ERROR_LOG(PMIX_ERROR);
+                        return PMIX_ERROR;
+                    }
                     size_t tmp = 0.0;
                     put_data_to_the_end(ns_info, datadesc, "EXTENSION_SLOT", (void*)&tmp, sizeof(size_t), 1);
                     (*rinfo)->count++;
@@ -765,7 +824,7 @@ static int store_data_for_rank(ns_track_elem_t *ns_info, int rank, pmix_buffer_t
         rc = PMIX_SUCCESS;
     }
 
-    /* reserve space for EXTENSION slot  TODO*/
+    /* reserve space for EXTENSION slot*/
     size_t tmp = 0.0, tmp2;
     tmp2 = put_data_to_the_end(ns_info, ns_info->data_seg, "EXTENSION_SLOT", (void*)&tmp, sizeof(size_t), 1);
 
