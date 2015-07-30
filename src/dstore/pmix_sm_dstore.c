@@ -69,31 +69,50 @@ static size_t max_meta_elems;
 static size_t data_segment_size = 0;
 static int lockfd;
 static char *lockfile_name;
+/* If direct_mode is set, it means that we use linear search
+ * along the array of rank meta info objects inside a meta segment
+ * to find the requested rank. Otherwise,  we do a fast lookup
+ * based on rank and directly compute offset.
+ * This mode is called direct because it's effectively used in
+ * sparse communication patterns when direct modex is usually used.
+ */
+static int direct_mode = 0;
 
 static void set_constants_from_env()
 {
     char *str;
+    int page_size = pmix_getpagesize();
     if( NULL != (str = getenv("INITIAL_SEG_SIZE")) ) {
         initial_segment_size = strtoul(str, NULL, 10);
+        if ((size_t)page_size > initial_segment_size) {
+            initial_segment_size = (size_t)page_size;
+        }
     }
     if (0 == initial_segment_size) {
         initial_segment_size = INITIAL_SEG_SIZE;
     }
     if( NULL != (str = getenv("NS_META_SEG_SIZE")) ) {
         meta_segment_size = strtoul(str, NULL, 10);
+        if ((size_t)page_size > meta_segment_size) {
+            meta_segment_size = (size_t)page_size;
+        }
     }
     if (0 == meta_segment_size) {
         meta_segment_size = NS_META_SEG_SIZE;
     }
     if( NULL != (str = getenv("NS_DATA_SEG_SIZE")) ) {
         data_segment_size = strtoul(str, NULL, 10);
-        int page_size = pmix_getpagesize();
         if ((size_t)page_size > data_segment_size) {
             data_segment_size = (size_t)page_size;
         }
     }
     if (0 == data_segment_size) {
         data_segment_size = NS_DATA_SEG_SIZE;
+    }
+    if (NULL != (str = getenv("SM_USE_LINEAR_SEARCH"))) {
+        if (1 == strtoul(str, NULL, 10)) {
+            direct_mode = 1;
+        }
     }
 }
 
@@ -444,21 +463,45 @@ static rank_meta_info *get_rank_meta_info(int rank, seg_desc_t *segdesc)
     size_t i;
     rank_meta_info *elem = NULL;
     seg_desc_t *tmp = segdesc;
-    size_t num_elems;
+    size_t num_elems, rel_offset;
+    int id;
     rank_meta_info *cur_elem;
-    /* go through all existing meta segments for this namespace */
-    do {
-        num_elems = *((size_t*)(tmp->seg_info.seg_base_addr));
-        for (i = 0; i < num_elems; i++) {
-            cur_elem = (rank_meta_info*)((uint8_t*)(tmp->seg_info.seg_base_addr) + sizeof(size_t) + i * sizeof(rank_meta_info));
-            if (rank == cur_elem->rank) {
-                elem = cur_elem;
-                break;
+    if (1 == direct_mode) {
+        /* do linear search to find the requested rank inside all meta segments
+         * for this namespace. */
+        /* go through all existing meta segments for this namespace */
+        do {
+            num_elems = *((size_t*)(tmp->seg_info.seg_base_addr));
+            for (i = 0; i < num_elems; i++) {
+                cur_elem = (rank_meta_info*)((uint8_t*)(tmp->seg_info.seg_base_addr) + sizeof(size_t) + i * sizeof(rank_meta_info));
+                if (rank == cur_elem->rank) {
+                    elem = cur_elem;
+                    break;
+                }
+            }
+            tmp = tmp->next;
+        }
+        while (NULL != tmp && NULL == elem);
+    } else {
+        /* directly compute index of meta segment (id) and relative offset (rel_offset)
+         * inside this segment for fast lookup a rank_meta_info object for the requested rank. */
+        id = rank/max_meta_elems;
+        rel_offset = (rank%max_meta_elems) * sizeof(rank_meta_info) + sizeof(size_t);
+        /* go through all existing meta segments for this namespace.
+         * Stop at id number if it exists. */
+        while (NULL != tmp->next && 0 != id) {
+            tmp = tmp->next;
+            id--;
+        }
+        if (0 == id) {
+            /* the segment is found, looking for data for the target rank. */
+            elem = (rank_meta_info*)((uint8_t*)(tmp->seg_info.seg_base_addr) + rel_offset);
+            if ( 0 == elem->offset) {
+                /* offset can never be 0, it means that there is no data for this rank yet. */
+                elem = NULL;
             }
         }
-        tmp = tmp->next;
     }
-    while (NULL != tmp && NULL == elem);
     return elem;
 }
 
@@ -486,43 +529,82 @@ static int update_rank_meta_info(ns_track_elem_t *ns_info, rank_meta_info *rinfo
 {
     PMIX_OUTPUT_VERBOSE((2, pmix_globals.debug_output,
                          "%s:%d:%s: nspace %s, add rank %d offset %lu count %lu meta info", __FILE__, __LINE__, __func__, ns_info->ns_name, rinfo->rank, rinfo->offset, rinfo->count));
-    /* it's claimed that there is still no meta info for this rank stored,
-     * so look for the last existing meta segment. */
+    /* it's claimed that there is still no meta info for this rank stored */
     seg_desc_t *tmp;
-    size_t num_elems;
+    size_t num_elems, rel_offset;
+    int id, count;
     rank_meta_info *cur_elem;
     tmp = ns_info->meta_seg;
-    while (NULL != tmp->next) {
-        tmp = tmp->next;
+    if (1 == direct_mode) {
+        /* get the last meta segment to put new rank_meta_info at the end. */
+        while (NULL != tmp->next) {
+            tmp = tmp->next;
+        }
+        num_elems = *((size_t*)(tmp->seg_info.seg_base_addr));
+        if (max_meta_elems <= num_elems) {
+            PMIX_OUTPUT_VERBOSE((2, pmix_globals.debug_output,
+                        "%s:%d:%s: extend meta segment for nspace %s", __FILE__, __LINE__, __func__, ns_info->ns_name));
+            /* extend meta segment, so create a new one */
+            tmp = extend_segment(tmp, ns_info->ns_name);
+            if (NULL == tmp) {
+                PMIX_ERROR_LOG(PMIX_ERROR);
+                return PMIX_ERROR;
+            }
+            ns_info->num_meta_seg++;
+            memset(tmp->seg_info.seg_base_addr, 0, sizeof(rank_meta_info));
+            /* update number of meta segments for namespace in initial_segment */
+            ns_seg_info_t *elem = get_ns_info_from_initial_segment(ns_info->ns_name);
+            if (NULL == elem) {
+                PMIX_ERROR_LOG(PMIX_ERROR);
+                return PMIX_ERROR;
+            }
+            if (ns_info->num_meta_seg != elem->num_meta_seg) {
+                elem->num_meta_seg = ns_info->num_meta_seg;
+            }
+            num_elems = 0;
+        }
+        cur_elem = (rank_meta_info*)((uint8_t*)(tmp->seg_info.seg_base_addr) + sizeof(size_t) + num_elems * sizeof(rank_meta_info));
+        memcpy(cur_elem, rinfo, sizeof(rank_meta_info));
+        num_elems++;
+        memcpy(tmp->seg_info.seg_base_addr, &num_elems, sizeof(size_t));
+    } else {
+        /* directly compute index of meta segment (id) and relative offset (rel_offset)
+         * inside this segment for fast lookup a rank_meta_info object for the requested rank. */
+        id = rinfo->rank/max_meta_elems;
+        rel_offset = (rinfo->rank % max_meta_elems) * sizeof(rank_meta_info) + sizeof(size_t);
+        count = id;
+        /* go through all existing meta segments for this namespace.
+         * Stop at id number if it exists. */
+        while (NULL != tmp->next && 0 != count) {
+            tmp = tmp->next;
+            count--;
+        }
+        /* if there is no segment with this id, then create all missing segments till the id number. */
+        if (ns_info->num_meta_seg < (id+1)) {
+            while (ns_info->num_meta_seg != (id+1)) {
+                /* extend meta segment, so create a new one */
+                tmp = extend_segment(tmp, ns_info->ns_name);
+                if (NULL == tmp) {
+                    PMIX_ERROR_LOG(PMIX_ERROR);
+                    return PMIX_ERROR;
+                }
+                memset(tmp->seg_info.seg_base_addr, 0, sizeof(rank_meta_info));
+                ns_info->num_meta_seg++;
+            }
+            /* update number of meta segments for namespace in initial_segment */
+            ns_seg_info_t *elem = get_ns_info_from_initial_segment(ns_info->ns_name);
+            if (NULL == elem) {
+                PMIX_ERROR_LOG(PMIX_ERROR);
+                return PMIX_ERROR;
+            }
+            if (ns_info->num_meta_seg != elem->num_meta_seg) {
+                elem->num_meta_seg = ns_info->num_meta_seg;
+            }
+        }
+        /* store rank_meta_info object by rel_offset. */
+        cur_elem = (rank_meta_info*)((uint8_t*)(tmp->seg_info.seg_base_addr) + rel_offset);
+        memcpy(cur_elem, rinfo, sizeof(rank_meta_info));
     }
-    num_elems = *((size_t*)(tmp->seg_info.seg_base_addr));
-    if (max_meta_elems <= num_elems) {
-        PMIX_OUTPUT_VERBOSE((2, pmix_globals.debug_output,
-                    "%s:%d:%s: extend meta segment for nspace %s", __FILE__, __LINE__, __func__, ns_info->ns_name));
-        /* extend meta segment, so create a new one */
-        tmp = extend_segment(tmp, ns_info->ns_name);
-        if (NULL == tmp) {
-            PMIX_ERROR_LOG(PMIX_ERROR);
-            return PMIX_ERROR;
-        }
-        ns_info->num_meta_seg++;
-        memset(tmp->seg_info.seg_base_addr, 0, sizeof(rank_meta_info));
-        /* update_ns_info_in_initial_segment */
-        ns_seg_info_t *elem = get_ns_info_from_initial_segment(ns_info->ns_name);
-        if (NULL == elem) {
-            PMIX_ERROR_LOG(PMIX_ERROR);
-            return PMIX_ERROR;
-        }
-        if (ns_info->num_meta_seg != elem->num_meta_seg) {
-            //elem->num_meta_seg++;
-            elem->num_meta_seg = ns_info->num_meta_seg;
-        }
-        num_elems = 0;
-    }
-    cur_elem = (rank_meta_info*)((uint8_t*)(tmp->seg_info.seg_base_addr) + sizeof(size_t) + num_elems * sizeof(rank_meta_info));
-    memcpy(cur_elem, rinfo, sizeof(rank_meta_info));
-    num_elems++;
-    memcpy(tmp->seg_info.seg_base_addr, &num_elems, sizeof(size_t));
     return PMIX_SUCCESS;
 }
 
@@ -531,21 +613,21 @@ static int update_rank_meta_info(ns_track_elem_t *ns_info, rank_meta_info *rinfo
 
 static size_t get_free_offset(seg_desc_t *data_seg)
 {
-     size_t offset;
-     seg_desc_t *tmp;
-     int id = 0;
-     tmp = data_seg;
-     /* first find the last data segment */
-     while (NULL != tmp->next) {
-         tmp = tmp->next;
-         id++;
-     }
-     offset = *((size_t*)(tmp->seg_info.seg_base_addr));
-     if (0 == offset) {
-         /* this is the first created data segment, the first 8 bytes are used to place the free offset value itself */
-         offset = sizeof(size_t);
-     }
-     return (id * data_segment_size + offset);
+    size_t offset;
+    seg_desc_t *tmp;
+    int id = 0;
+    tmp = data_seg;
+    /* first find the last data segment */
+    while (NULL != tmp->next) {
+        tmp = tmp->next;
+        id++;
+    }
+    offset = *((size_t*)(tmp->seg_info.seg_base_addr));
+    if (0 == offset) {
+        /* this is the first created data segment, the first 8 bytes are used to place the free offset value itself */
+        offset = sizeof(size_t);
+    }
+    return (id * data_segment_size + offset);
 }
 
 static int put_empty_ext_slot(seg_desc_t *dataseg)
@@ -842,7 +924,9 @@ static int store_data_for_rank(ns_track_elem_t *ns_info, int rank, pmix_buffer_t
     
     num_elems = *((size_t*)(metadesc->seg_info.seg_base_addr));
     replace_flag = 0;
-    if (0 < num_elems) {
+    /* when we don't use linear search (direct_mode ==0 ) we don't use num_elems field,
+     * so anyway try to get rank_meta_info first. */
+    if (0 < num_elems || 0 == direct_mode) {
         /* go through all elements in meta segment and look for target rank. */
         rinfo = get_rank_meta_info(rank, metadesc);
         if (NULL != rinfo) {
@@ -1060,7 +1144,9 @@ int sm_data_fetch(char *nspace, int rank, char *key, pmix_value_t **kvs)
     meta_seg = elem->meta_seg;
     data_seg = elem->data_seg;
     num_elems = *((size_t*)(meta_seg->seg_info.seg_base_addr));
-    if (0 == num_elems) {
+    /* only when we use linear search (direct_mode == 1 ), we set num_elems field,
+     * so if no elements is found, return */
+    if (0 == num_elems && 1 == direct_mode) {
         /* no data for this rank is found in the shared memory. */
         PMIX_OUTPUT_VERBOSE((0, pmix_globals.debug_output,
                     "%s:%d:%s:  no data for this rank is found in the shared memory. rank %d", __FILE__, __LINE__, __func__, rank));
