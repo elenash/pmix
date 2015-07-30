@@ -257,6 +257,7 @@ static seg_desc_t *attach_new_segment(segment_type type, char *nsname, uint32_t 
     return new_seg;
 }
 
+/* This function synchronizes the content of initial shared segment and the local track list. */
 static int update_ns_elem(ns_track_elem_t *ns_elem, ns_seg_info_t *info)
 {
     PMIX_OUTPUT_VERBOSE((10, pmix_globals.debug_output,
@@ -271,6 +272,7 @@ static int update_ns_elem(ns_track_elem_t *ns_elem, ns_seg_info_t *info)
         }
     }
 
+    /* synchronize number of meta segments for the target namespace. */
     for (i = ns_elem->num_meta_seg; i < info->num_meta_seg; i++) {
         if (0 == is_client) {
             seg = create_new_segment(NS_META_SEGMENT, info->ns_name, i);
@@ -296,6 +298,7 @@ static int update_ns_elem(ns_track_elem_t *ns_elem, ns_seg_info_t *info)
             tmp = tmp->next;
         }
     }
+    /* synchronize number of data segments for the target namespace. */
     for (i = ns_elem->num_data_seg; i < info->num_data_seg; i++) {
         if (0 == is_client) {
             seg = create_new_segment(NS_DATA_SEGMENT, info->ns_name, i);
@@ -505,27 +508,7 @@ static rank_meta_info *get_rank_meta_info(int rank, seg_desc_t *segdesc)
     return elem;
 }
 
-static uint8_t *get_data_region_by_offset(seg_desc_t *segdesc, size_t offset)
-{
-    PMIX_OUTPUT_VERBOSE((10, pmix_globals.debug_output,
-                         "%s:%d:%s", __FILE__, __LINE__, __func__));
-    seg_desc_t *tmp = segdesc;
-    size_t rel_offset = offset;
-    uint8_t *dataaddr = NULL;
-    /* go through all existing data segments for this namespace */
-    do {
-        if (rel_offset >= data_segment_size) {
-            rel_offset -= data_segment_size;
-        } else {
-            dataaddr = tmp->seg_info.seg_base_addr + rel_offset;
-        }
-        tmp = tmp->next;
-    }
-    while (NULL != tmp && NULL == dataaddr);
-    return dataaddr;
-}
-
-static int update_rank_meta_info(ns_track_elem_t *ns_info, rank_meta_info *rinfo)
+static int set_rank_meta_info(ns_track_elem_t *ns_info, rank_meta_info *rinfo)
 {
     PMIX_OUTPUT_VERBOSE((2, pmix_globals.debug_output,
                          "%s:%d:%s: nspace %s, add rank %d offset %lu count %lu meta info", __FILE__, __LINE__, __func__, ns_info->ns_name, rinfo->rank, rinfo->offset, rinfo->count));
@@ -606,6 +589,26 @@ static int update_rank_meta_info(ns_track_elem_t *ns_info, rank_meta_info *rinfo
         memcpy(cur_elem, rinfo, sizeof(rank_meta_info));
     }
     return PMIX_SUCCESS;
+}
+
+static uint8_t *get_data_region_by_offset(seg_desc_t *segdesc, size_t offset)
+{
+    PMIX_OUTPUT_VERBOSE((10, pmix_globals.debug_output,
+                         "%s:%d:%s", __FILE__, __LINE__, __func__));
+    seg_desc_t *tmp = segdesc;
+    size_t rel_offset = offset;
+    uint8_t *dataaddr = NULL;
+    /* go through all existing data segments for this namespace */
+    do {
+        if (rel_offset >= data_segment_size) {
+            rel_offset -= data_segment_size;
+        } else {
+            dataaddr = tmp->seg_info.seg_base_addr + rel_offset;
+        }
+        tmp = tmp->next;
+    }
+    while (NULL != tmp && NULL == dataaddr);
+    return dataaddr;
 }
 
 #define EXT_SLOT_SIZE (PMIX_MAX_KEYLEN + 1 + 2*sizeof(size_t)) /* in ext slot new offset will be stored in case if new data were added for the same process during next commit */
@@ -716,10 +719,10 @@ static size_t put_data_to_the_end(ns_track_elem_t *ns_info, seg_desc_t *dataseg,
     return global_offset;
 }
 
-static int pmix_sm_store(ns_track_elem_t *ns_info, int rank, pmix_kval_t *kval, rank_meta_info **rinfo, int replace_flag)
+static int pmix_sm_store(ns_track_elem_t *ns_info, int rank, pmix_kval_t *kval, rank_meta_info **rinfo, int data_exist)
 {
     PMIX_OUTPUT_VERBOSE((2, pmix_globals.debug_output,
-                         "%s:%d:%s: for rank %d, replace flag %d", __FILE__, __LINE__, __func__, rank, replace_flag));
+                         "%s:%d:%s: for rank %d, replace flag %d", __FILE__, __LINE__, __func__, rank, data_exist));
     size_t offset, size, kval_cnt;
     pmix_buffer_t *buffer;
     int rc;
@@ -736,7 +739,7 @@ static int pmix_sm_store(ns_track_elem_t *ns_info, int rank, pmix_kval_t *kval, 
     }
     size = buffer->bytes_used;
 
-    if (0 == replace_flag) {
+    if (0 == data_exist) {
         /* there is no data blob for this rank yet, so add it. */
         size_t free_offset;
         free_offset = get_free_offset(datadesc);
@@ -747,8 +750,16 @@ static int pmix_sm_store(ns_track_elem_t *ns_info, int rank, pmix_kval_t *kval, 
             PMIX_ERROR_LOG(PMIX_ERROR);
             return PMIX_ERROR;
         }
+        /* if it's the first time when we put data for this rank, then *rinfo == NULL,
+         * and even if segment was extended, and data was put into the next segment,
+         * we don't need to extension slot at the end of previous segment.
+         * If we try, we might overwrite other segments memory,
+         * because previous segment is already full. */
         if (free_offset != offset && NULL != *rinfo) {
-            /* segment was extended, need to put extension slot by free_offset indicating new_offset */
+            /* here we compare previous free offset with the offset where we just put data.
+             * It should be equal in the normal case. It it's not true, then it means that
+             * segment was extended, and we put data to the next segment, so we now need to
+             * put extension slot at the end of previous segment with a "reference" to a new_offset */
             size_t sz = sizeof(size_t);
             addr = get_data_region_by_offset(datadesc, free_offset);
             strncpy(addr, "EXTENSION_SLOT", PMIX_MAX_KEYLEN+1);
@@ -775,7 +786,7 @@ static int pmix_sm_store(ns_track_elem_t *ns_info, int rank, pmix_kval_t *kval, 
          * Then put a new empty offset to the next extension slot,
          * and add new kval by this offset. 
          * no need to update meta info, it's still the same. */
-    //size_t ofs= (*rinfo)->offset;
+        //size_t ofs= (*rinfo)->offset;
         kval_cnt = (*rinfo)->count;
         int add_to_the_end = 1;
         while (0 < kval_cnt) {
@@ -791,7 +802,7 @@ static int pmix_sm_store(ns_track_elem_t *ns_info, int rank, pmix_kval_t *kval, 
                 offset = *(size_t *)(addr + PMIX_MAX_KEYLEN + 1 + sizeof(size_t));
                 if (0 < offset) {
                     PMIX_OUTPUT_VERBOSE((10, pmix_globals.debug_output,
-                                "%s:%d:%s: for rank %d, replace flag %d EXTENSION_SLOT is filled with %lu value", __FILE__, __LINE__, __func__, rank, replace_flag, offset));
+                                "%s:%d:%s: for rank %d, replace flag %d EXTENSION_SLOT is filled with %lu value", __FILE__, __LINE__, __func__, rank, data_exist, offset));
                     /* go to next item, updating address */
                     addr = get_data_region_by_offset(datadesc, offset);
                     if (NULL == addr) {
@@ -800,17 +811,17 @@ static int pmix_sm_store(ns_track_elem_t *ns_info, int rank, pmix_kval_t *kval, 
                         return rc;
                     }
                     //fprintf(stderr, "EXTENSION_SLOT for rank %d\n", rank);
-       //             ofs = offset;
+                    //ofs = offset;
                 } else {
                     /* should not be, we should be out of cycle when this happens */
                 }
             } else if (0 == strncmp(addr, kval->key, PMIX_MAX_KEYLEN+1)) {
                 PMIX_OUTPUT_VERBOSE((10, pmix_globals.debug_output,
-                            "%s:%d:%s: for rank %d, replace flag %d found target key %s", __FILE__, __LINE__, __func__, rank, replace_flag, kval->key));
+                            "%s:%d:%s: for rank %d, replace flag %d found target key %s", __FILE__, __LINE__, __func__, rank, data_exist, kval->key));
                 /* target key is found, compare value sizes */
                 size_t cur_size = *(size_t *)(addr + PMIX_MAX_KEYLEN + 1);
                 if (cur_size != size) {
-                //if (1) {
+                //if (1) { /* if we want to test replacing values for existing keys. */
                     //fprintf(stderr, "mark invalidated rank %d key %s\n", rank, kval->key);
                     /* invalidate current value and store another one at the end of data region. */
                     strncpy(addr, "INVALIDATED", PMIX_MAX_KEYLEN+1);
@@ -819,12 +830,12 @@ static int pmix_sm_store(ns_track_elem_t *ns_info, int rank, pmix_kval_t *kval, 
                     kval_cnt--;
                     /* go to next item, updating address */
                     addr += KVAL_SIZE(cur_size);
-    //                ofs += PMIX_MAX_KEYLEN + 1 + sizeof(size_t) + cur_size;
+                    //ofs += PMIX_MAX_KEYLEN + 1 + sizeof(size_t) + cur_size;
                     PMIX_OUTPUT_VERBOSE((10, pmix_globals.debug_output,
-                                "%s:%d:%s: for rank %d, replace flag %d mark key %s regions as invalidated. put new data at the end.", __FILE__, __LINE__, __func__, rank, replace_flag, kval->key));
+                                "%s:%d:%s: for rank %d, replace flag %d mark key %s regions as invalidated. put new data at the end.", __FILE__, __LINE__, __func__, rank, data_exist, kval->key));
                 } else {
                     PMIX_OUTPUT_VERBOSE((1, pmix_globals.debug_output,
-                                "%s:%d:%s: for rank %d, replace flag %d replace data for key %s type %d in place", __FILE__, __LINE__, __func__, rank, replace_flag, kval->key, kval->value->type));
+                                "%s:%d:%s: for rank %d, replace flag %d replace data for key %s type %d in place", __FILE__, __LINE__, __func__, rank, data_exist, kval->key, kval->value->type));
                     /* replace old data with new one. */
                     addr += PMIX_MAX_KEYLEN + 1;
                     memcpy(addr, &size, sizeof(size_t));
@@ -839,9 +850,8 @@ static int pmix_sm_store(ns_track_elem_t *ns_info, int rank, pmix_kval_t *kval, 
                 char ckey[PMIX_MAX_KEYLEN+1] = {0};
                 strncpy(ckey, addr, PMIX_MAX_KEYLEN+1);
                 PMIX_OUTPUT_VERBOSE((10, pmix_globals.debug_output,
-                            "%s:%d:%s: for rank %d, replace flag %d skip %s key, look for %s key", __FILE__, __LINE__, __func__, rank, replace_flag, ckey, kval->key));
-                /* key == "INVALIDATED" or key is real but different from target one. */
-                /*skip it */
+                            "%s:%d:%s: for rank %d, replace flag %d skip %s key, look for %s key", __FILE__, __LINE__, __func__, rank, data_exist, ckey, kval->key));
+                /* Skip it: key is "INVALIDATED" or key is valid but different from target one. */
                 if (0 != strncmp("INVALIDATED", ckey, PMIX_MAX_KEYLEN+1)) {
                     /* count only valid items */
                     kval_cnt--;
@@ -849,11 +859,14 @@ static int pmix_sm_store(ns_track_elem_t *ns_info, int rank, pmix_kval_t *kval, 
                 size_t size = *(size_t *)(addr + PMIX_MAX_KEYLEN + 1);
                 /* go to next item, updating address */
                 addr += KVAL_SIZE(size);
-                //            ofs += PMIX_MAX_KEYLEN + 1 + sizeof(size_t) + size;
+                //ofs += PMIX_MAX_KEYLEN + 1 + sizeof(size_t) + size;
                 //fprintf(stderr, "skip %s for rank %d cnt = %d\n", ckey, rank, kval_cnt);
             }
         }
         if (1 == add_to_the_end) {
+            /* if we get here, it means that we want to add a new item for the target rank, or
+             * we mark existing item with the same key as "invalidated" and want to add new item
+             * for the same key. */
             (*rinfo)->count++;
             size_t free_offset;
             free_offset = get_free_offset(datadesc);
@@ -871,7 +884,7 @@ static int pmix_sm_store(ns_track_elem_t *ns_info, int rank, pmix_kval_t *kval, 
              */
             if (0 == strncmp(addr, "EXTENSION_SLOT", PMIX_MAX_KEYLEN+1)) {
                 PMIX_OUTPUT_VERBOSE((10, pmix_globals.debug_output,
-                            "%s:%d:%s: for rank %d, replace flag %d EXTENSION_SLOT should be filled with offset %lu value", __FILE__, __LINE__, __func__, rank, replace_flag, offset));
+                            "%s:%d:%s: for rank %d, replace flag %d EXTENSION_SLOT should be filled with offset %lu value", __FILE__, __LINE__, __func__, rank, data_exist, offset));
                 memcpy(addr + PMIX_MAX_KEYLEN + 1 + sizeof(size_t), &offset, sizeof(size_t));
             } else {
                 /* (2) - we point to the first free offset, no more data is stored further in this segment.
@@ -889,7 +902,7 @@ static int pmix_sm_store(ns_track_elem_t *ns_info, int rank, pmix_kval_t *kval, 
                 }
             }
             PMIX_OUTPUT_VERBOSE((10, pmix_globals.debug_output,
-                        "%s:%d:%s: for rank %d, replace flag %d item not found ext slot empty, put key %s to the end", __FILE__, __LINE__, __func__, rank, replace_flag, kval->key));
+                        "%s:%d:%s: for rank %d, replace flag %d item not found ext slot empty, put key %s to the end", __FILE__, __LINE__, __func__, rank, data_exist, kval->key));
             //fprintf(stderr, "put to the end for rank %d key %s\n", rank, kval->key);
         }
     }
@@ -912,7 +925,7 @@ static int store_data_for_rank(ns_track_elem_t *ns_info, int rank, pmix_buffer_t
     
     rank_meta_info *rinfo = NULL;
     size_t num_elems, free_offset, new_free_offset;
-    int replace_flag;
+    int data_exist;
 
     metadesc = ns_info->meta_seg;    
     datadesc = ns_info->data_seg;    
@@ -923,14 +936,14 @@ static int store_data_for_rank(ns_track_elem_t *ns_info, int rank, pmix_buffer_t
     }
     
     num_elems = *((size_t*)(metadesc->seg_info.seg_base_addr));
-    replace_flag = 0;
+    data_exist = 0;
     /* when we don't use linear search (direct_mode ==0 ) we don't use num_elems field,
      * so anyway try to get rank_meta_info first. */
     if (0 < num_elems || 0 == direct_mode) {
         /* go through all elements in meta segment and look for target rank. */
         rinfo = get_rank_meta_info(rank, metadesc);
         if (NULL != rinfo) {
-            replace_flag = 1;
+            data_exist = 1;
         }
     }
     /* incoming buffer may contain several inner buffers for different scopes,
@@ -945,7 +958,7 @@ static int store_data_for_rank(ns_track_elem_t *ns_info, int rank, pmix_buffer_t
         while (PMIX_SUCCESS == (rc = pmix_bfrop.unpack(bptr, kp, &cnt, PMIX_KVAL))) {
             pmix_output_verbose(2, pmix_globals.debug_output,
                                 "pmix: unpacked key %s", kp->key);
-            if (PMIX_SUCCESS != (rc = pmix_sm_store(ns_info, rank, kp, &rinfo, replace_flag))) {
+            if (PMIX_SUCCESS != (rc = pmix_sm_store(ns_info, rank, kp, &rinfo, data_exist))) {
                 PMIX_ERROR_LOG(rc);
             }
             PMIX_RELEASE(kp); // maintain acctg - hash_store does a retain
@@ -988,8 +1001,8 @@ static int store_data_for_rank(ns_track_elem_t *ns_info, int rank, pmix_buffer_t
 
     /* if this is the first data posted for this rank, then
      * update meta info for it */
-    if (0 == replace_flag) {
-        update_rank_meta_info(ns_info, rinfo);
+    if (0 == data_exist) {
+        set_rank_meta_info(ns_info, rinfo);
         if (NULL != rinfo) {
             free(rinfo);
         }
@@ -1025,13 +1038,15 @@ int sm_data_store(pmix_buffer_t *buf)
     /* set exclusive lock */
     flock(lockfd, LOCK_EX);
 
-    /* first of all look for this namespace in the local track list,
-     * if it is there, then shared memory segments for it are created,
-     * we might need just extend them by creating new segments and put
-     * their info as a last element, and updating the tracker consequently.
-     * If current namespace doesn't exist in the local track list, then
-     * create all necessary shared memory segments for it, put info about it
-     * to the initial shared segment and append it to the local track list. */ 
+    /* First of all, we go through local track list (list of ns_track_elem_t structures)
+     * and look for an element for the target namespace.
+     * If it is there, then shared memory segments for it are created, so we take it.
+     * Otherwise, create a new element, fill its fields, create corresponding meta
+     * and data segments for this namespace, add it to the local track list,
+     * and put this info (ns_seg_info_t) to the initial segment. If initial segment
+     * if full, then extend it by creating a new one and mark previous one as full.
+     * All this staff is done inside get_track_elem_for_namespace function.
+     */
 
     elem = get_track_elem_for_namespace(nspace);
     if (NULL == elem) {
@@ -1041,7 +1056,8 @@ int sm_data_store(pmix_buffer_t *buf)
         return PMIX_ERROR;
     }
 
-    /* if elem was just created, need to create corresponding meta and data segments and update elem's fields */
+    /* If a new element was just created, we need to create corresponding meta and
+     * data segments and update corresponding element's fields. */
     if (NULL == elem->meta_seg || NULL == elem->data_seg) {
         strncpy(ns_info.ns_name, nspace, PMIX_MAX_NSLEN+1);
         ns_info.num_meta_seg = 1;
@@ -1070,7 +1086,7 @@ int sm_data_store(pmix_buffer_t *buf)
         }
     }
 
-    /* now we know info about meta segment for this namespace. If meta segment
+    /* Now we know info about meta segment for this namespace. If meta segment
      * is not empty, then we look for data for the target rank. If they present, replace it. */
     rc = store_data_for_rank(elem, rank, buf);
 
@@ -1087,7 +1103,7 @@ int sm_data_fetch(char *nspace, int rank, char *key, pmix_value_t **kvs)
     int rc;
     ns_track_elem_t *elem;
     rank_meta_info *rinfo = NULL;
-    size_t num_elems, kval_cnt, i;
+    size_t kval_cnt, i;
     seg_desc_t *meta_seg, *data_seg;
     uint8_t *addr;
     pmix_buffer_t buffer;
@@ -1096,22 +1112,22 @@ int sm_data_fetch(char *nspace, int rank, char *key, pmix_value_t **kvs)
     /* set shared lock */
     flock(lockfd, LOCK_SH);
 
-    /* first of all look for this namespace in the initial segment,
-     * if it is there, get numbers of meta & data segments and
+    /* First of all, we go through all initial segments and look at their ‘full’ field.
+     * If it’s 1, then generate name of next initial segment incrementing id by one and attach to it.
+     * We need this step to synchronize initial shared segments with our local track list.
+     * Then we look for the target namespace in all initial segments.
+     * If it is found, we get numbers of meta & data segments and
      * compare these numbers with the number of trackable meta & data
      * segments for this namespace in the local track list.
      * If the first number exceeds the last, or the local track list
      * doesn't track current namespace yet, then we update it (attach
      * to additional segments).
-     * Then we just look for the rank blob in the shared meta segment,
-     * which address we get from the local track list.
      */
 
-    /* get information about shared segments per this namespace from the initial segment. */
-    /* probably need to get just nspace from the initial segment, based on it we can generate file name to attach. */
     /* first update local information about initial segments. they can be extended, so then we need to attach to new segments. */
     update_initial_segment_info();
 
+    /* get information about shared segments per this namespace from the initial segment. */
     ns_info = get_ns_info_from_initial_segment(nspace);
     if (NULL == ns_info) {
         /* no data for this namespace is found in the shared memory. */
@@ -1122,6 +1138,7 @@ int sm_data_fetch(char *nspace, int rank, char *key, pmix_value_t **kvs)
         return PMIX_ERROR;
     }
 
+    /* get ns_track_elem_t object for the target namespace from the local track list. */
     elem = get_track_elem_for_namespace(nspace);
     if (NULL == elem) {
         PMIX_ERROR_LOG(PMIX_ERROR);
@@ -1143,20 +1160,8 @@ int sm_data_fetch(char *nspace, int rank, char *key, pmix_value_t **kvs)
     /* now we know info about meta segment for this namespace. */
     meta_seg = elem->meta_seg;
     data_seg = elem->data_seg;
-    num_elems = *((size_t*)(meta_seg->seg_info.seg_base_addr));
-    /* only when we use linear search (direct_mode == 1 ), we set num_elems field,
-     * so if no elements is found, return */
-    if (0 == num_elems && 1 == direct_mode) {
-        /* no data for this rank is found in the shared memory. */
-        PMIX_OUTPUT_VERBOSE((0, pmix_globals.debug_output,
-                    "%s:%d:%s:  no data for this rank is found in the shared memory. rank %d", __FILE__, __LINE__, __func__, rank));
-        /* unset lock */
-        flock(lockfd, LOCK_UN);
-        return PMIX_ERROR;
-    } else {
-        /* go through all elements and look for target rank. */
-        rinfo = get_rank_meta_info(rank, meta_seg);
-    }
+    /* Then we look for the rank meta info in the shared meta segment. */
+    rinfo = get_rank_meta_info(rank, meta_seg);
     if (NULL == rinfo) {
         PMIX_OUTPUT_VERBOSE((0, pmix_globals.debug_output,
                     "%s:%d:%s:  no data for this rank is found in the shared memory. rank %d", __FILE__, __LINE__, __func__, rank));
